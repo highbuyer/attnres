@@ -143,11 +143,11 @@ def download_data(num_python_shards=10, download_workers=8):
         texts = [f"Human: {i}\nAssistant: {o}" for i, o in zip(instructions, outputs)]
         text_col = pa.array(texts, type=pa.string())
         text_table = pa.table({"text": text_col})
-        val_size = 2000
+        val_size = len(texts) // 10  # 10% val
         pq.write_table(text_table.slice(0, len(texts) - val_size), belle_train)
         pq.write_table(text_table.slice(len(texts) - val_size), belle_val_tmp)
         os.remove(belle_raw)
-        print(f"Data: Belle split → {len(texts)-val_size} train + {val_size} val rows")
+        print(f"Data: Belle split → {len(texts)-val_size} train + {val_size} val rows (10%)")
 
     # --- Glaive function calling v2 ---
     glaive_train = os.path.join(DATA_DIR, "glaive_train.parquet")
@@ -163,26 +163,47 @@ def download_data(num_python_shards=10, download_workers=8):
         else:
             table = pq.read_table(glaive_raw)
             chats = table.column("chat").to_pylist()
-            val_size = 1000
+            val_size = len(chats) // 10  # 10% val
             train_texts = pa.array(chats[:-val_size], type=pa.string())
             val_texts = pa.array(chats[-val_size:], type=pa.string())
             pq.write_table(pa.table({"text": train_texts}), glaive_train)
             pq.write_table(pa.table({"text": val_texts}), glaive_val_tmp)
             os.remove(glaive_raw)
-            print(f"Data: Glaive → {len(chats)-val_size} train + {val_size} val rows")
+            print(f"Data: Glaive v2 → {len(chats)-val_size} train + {val_size} val rows (10%)")
 
-    # --- Merge val shards ---
+    # --- Merge val shards: 10% from each source ---
     val_path = os.path.join(DATA_DIR, VAL_FILENAME)
     if not os.path.exists(val_path):
         tables = []
-        for tmp in [belle_val_tmp, glaive_val_tmp]:
-            if os.path.exists(tmp):
-                tables.append(pq.read_table(tmp))
+        # Belle 0.5M val
+        if os.path.exists(belle_val_tmp):
+            tables.append(pq.read_table(belle_val_tmp))
+        # Glaive v2 val
+        if os.path.exists(glaive_val_tmp):
+            tables.append(pq.read_table(glaive_val_tmp))
+        # Belle 2M: 10% from each shard
+        for i in range(BELLE_2M_NUM_SHARDS):
+            shard_path = os.path.join(DATA_DIR, f"belle2m_{i:04d}.parquet")
+            if os.path.exists(shard_path):
+                t = pq.read_table(shard_path, columns=["text"])
+                val_n = t.num_rows // 10
+                tables.append(t.slice(t.num_rows - val_n))
+        # Glaive v1: 10%
+        glaive_v1_path = os.path.join(DATA_DIR, "glaive_v1_train.parquet")
+        if os.path.exists(glaive_v1_path):
+            t = pq.read_table(glaive_v1_path, columns=["text"])
+            val_n = t.num_rows // 10
+            tables.append(t.slice(t.num_rows - val_n))
+        # Python: 10% from python_0009
+        python_val_src = os.path.join(DATA_DIR, "python_0009.parquet")
+        if os.path.exists(python_val_src):
+            t = pq.read_table(python_val_src, columns=["text"])
+            val_n = t.num_rows // 10
+            tables.append(t.slice(t.num_rows - val_n))
         if tables:
-            import pyarrow as pa_local
-            merged = pa_local.concat_tables(tables)
+            merged = pa.concat_tables(tables)
             pq.write_table(merged, val_path)
-            print(f"Data: val.parquet → {merged.num_rows} rows (Belle + Glaive mixed)")
+            print(f"Data: val.parquet → {merged.num_rows} rows (all sources 10% val)")
 
     # --- Belle 2M CN ---
     belle2m_done = os.path.join(DATA_DIR, "belle2m_done.flag")

@@ -23,7 +23,8 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET as _TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+TIME_BUDGET = 1800  # override: 30 minutes instead of 5
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -444,10 +445,10 @@ WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.1# final LR as fraction of initial
+FINAL_LR_FRAC = 0.1  # final LR as fraction of initial
 
 # Model size
-DEPTH = 6               # number of transformer layers
+DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 16  # per-device batch size (4090: 128 OOMs)
 
 # ---------------------------------------------------------------------------
