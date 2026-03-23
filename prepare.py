@@ -18,6 +18,7 @@ import pickle
 from multiprocessing import Pool
 
 import requests
+import pyarrow as pa
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
@@ -35,14 +36,21 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-custom")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+VAL_FILENAME = "val.parquet"  # pinned validation shard
 VOCAB_SIZE = 8192
+
+# HuggingFace parquet URLs
+# Belle: single parquet for the 0.5M CN instruction set
+BELLE_TRAIN_URL = "https://huggingface.co/datasets/BelleGroup/train_0.5M_CN/resolve/main/Belle_open_source_0.5M.json"
+BELLE_PARQUET_URL = "https://huggingface.co/datasets/BelleGroup/train_0.5M_CN/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
+# GitHub Python (codeparrot/github-code-clean, Python-all config, first N shards)
+PYTHON_BASE_URL = "https://huggingface.co/datasets/codeparrot/github-code-clean/resolve/refs%2Fconvert%2Fparquet/Python-all/partial-train"
+PYTHON_MAX_SHARD = 9  # 0000..0009 (10 shards total)
+# Glaive function calling v2 (tool-use conversations)
+GLAIVE_PARQUET_URL = "https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -54,18 +62,14 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
+def _fetch_url(url, filepath):
+    """Download url to filepath with retries. Returns True on success."""
     if os.path.exists(filepath):
         return True
-
-    url = f"{BASE_URL}/{filename}"
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
+            response = requests.get(url, stream=True, timeout=60)
             response.raise_for_status()
             temp_path = filepath + ".tmp"
             with open(temp_path, "wb") as f:
@@ -73,10 +77,10 @@ def download_single_shard(index):
                     if chunk:
                         f.write(chunk)
             os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
+            print(f"  Downloaded {os.path.basename(filepath)}")
             return True
         except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
+            print(f"  Attempt {attempt}/{max_attempts} failed for {os.path.basename(filepath)}: {e}")
             for path in [filepath + ".tmp", filepath]:
                 if os.path.exists(path):
                     try:
@@ -88,29 +92,91 @@ def download_single_shard(index):
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def _download_python_shard(index):
+    """Download one GitHub Python parquet shard, rewrite with unified 'text' column."""
+    filename = f"{index:04d}.parquet"
+    filepath = os.path.join(DATA_DIR, f"python_{filename}")
+    if os.path.exists(filepath):
+        return True
+    url = f"{PYTHON_BASE_URL}/{filename}"
+    ok = _fetch_url(url, filepath + ".raw")
+    if not ok:
+        return False
+    # HuggingFace Python shards use 'code' column; rewrite as 'text' for uniform schema
+    table = pq.read_table(filepath + ".raw", columns=["code"])
+    pq.write_table(table.rename_columns(["text"]), filepath)
+    os.remove(filepath + ".raw")
+    return True
+
+
+def download_data(num_python_shards=10, download_workers=8):
+    """Download Belle CN + GitHub Python parquet files.
+
+    Belle: one parquet → split into train.parquet + val.parquet (last 2k rows).
+    Python: first num_python_shards shards from GitHub Python dataset.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+    # --- Belle ---
+    belle_train = os.path.join(DATA_DIR, "belle_train.parquet")
+    belle_val = os.path.join(DATA_DIR, VAL_FILENAME)
+    if os.path.exists(belle_train) and os.path.exists(belle_val):
+        print(f"Data: Belle already prepared at {DATA_DIR}")
+    else:
+        belle_raw = os.path.join(DATA_DIR, "belle_raw.parquet")
+        print("Data: downloading Belle CN...")
+        ok = _fetch_url(BELLE_PARQUET_URL, belle_raw)
+        if not ok:
+            print("ERROR: failed to download Belle parquet")
+            sys.exit(1)
+        # Split into train + val
+        pf = pq.ParquetFile(belle_raw)
+        table = pf.read()
+        # Build text column: "Human: {instruction}\nAssistant: {output}"
+        instructions = table.column("instruction").to_pylist()
+        outputs = table.column("output").to_pylist()
+        texts = [f"Human: {i}\nAssistant: {o}" for i, o in zip(instructions, outputs)]
+        text_col = pa.array(texts, type=pa.string())
+        text_table = pa.table({"text": text_col})
+        val_size = 2000
+        pq.write_table(text_table.slice(0, len(texts) - val_size), belle_train)
+        pq.write_table(text_table.slice(len(texts) - val_size), belle_val)
+        os.remove(belle_raw)  # 删除原始文件，避免被 list_parquet_files 扫到
+        print(f"Data: Belle split → {len(texts)-val_size} train + {val_size} val rows")
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    # --- Glaive function calling v2 ---
+    glaive_train = os.path.join(DATA_DIR, "glaive_train.parquet")
+    if os.path.exists(glaive_train):
+        print(f"Data: Glaive already prepared at {DATA_DIR}")
+    else:
+        glaive_raw = os.path.join(DATA_DIR, "glaive_raw.parquet")
+        print("Data: downloading Glaive function-calling-v2...")
+        ok = _fetch_url(GLAIVE_PARQUET_URL, glaive_raw)
+        if not ok:
+            print("WARNING: failed to download Glaive parquet, skipping")
+        else:
+            table = pq.read_table(glaive_raw)
+            # 'chat' column contains the full conversation as text
+            chats = table.column("chat").to_pylist()
+            text_table = pa.table({"text": pa.array(chats, type=pa.string())})
+            pq.write_table(text_table, glaive_train)
+            os.remove(glaive_raw)
+            print(f"Data: Glaive → {len(chats)} train rows")
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    # --- GitHub Python ---
+    num_shards = min(num_python_shards, PYTHON_MAX_SHARD + 1)
+    existing = sum(1 for i in range(num_shards)
+                   if os.path.exists(os.path.join(DATA_DIR, f"python_{i:04d}.parquet")))
+    if existing == num_shards:
+        print(f"Data: Python shards already downloaded ({num_shards} shards)")
+    else:
+        needed = num_shards - existing
+        print(f"Data: downloading {needed} Python shards ({existing} already exist)...")
+        workers = max(1, min(download_workers, needed))
+        with Pool(processes=workers) as pool:
+            results = pool.map(_download_python_shard, list(range(num_shards)))
+        ok = sum(1 for r in results if r)
+        print(f"Data: {ok}/{num_shards} Python shards ready")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -374,13 +440,13 @@ if __name__ == "__main__":
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    num_python_shards = PYTHON_MAX_SHARD + 1 if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
     # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    download_data(num_python_shards, download_workers=args.download_workers)
     print()
 
     # Step 2: Train tokenizer
