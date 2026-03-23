@@ -51,6 +51,11 @@ PYTHON_BASE_URL = "https://huggingface.co/datasets/codeparrot/github-code-clean/
 PYTHON_MAX_SHARD = 9  # 0000..0009 (10 shards total)
 # Glaive function calling v2 (tool-use conversations)
 GLAIVE_PARQUET_URL = "https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
+# Glaive function calling v1 (additional tool-use)
+GLAIVE_V1_PARQUET_URL = "https://huggingface.co/datasets/glaiveai/glaive-function-calling/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
+# Belle 2M CN (large Chinese instruction set, 3 shards)
+BELLE_2M_BASE_URL = "https://huggingface.co/datasets/BelleGroup/train_2M_CN/resolve/refs%2Fconvert%2Fparquet/default/train"
+BELLE_2M_NUM_SHARDS = 3
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -110,17 +115,19 @@ def _download_python_shard(index):
 
 
 def download_data(num_python_shards=10, download_workers=8):
-    """Download Belle CN + GitHub Python parquet files.
+    """Download Belle CN + Glaive + GitHub Python parquet files.
 
-    Belle: one parquet → split into train.parquet + val.parquet (last 2k rows).
+    Belle: one parquet → split into train.parquet + val contribution (last 2k rows).
+    Glaive: split into train + val contribution (last 1k rows).
+    val.parquet: merged from Belle val + Glaive val (mixed distribution).
     Python: first num_python_shards shards from GitHub Python dataset.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
 
     # --- Belle ---
     belle_train = os.path.join(DATA_DIR, "belle_train.parquet")
-    belle_val = os.path.join(DATA_DIR, VAL_FILENAME)
-    if os.path.exists(belle_train) and os.path.exists(belle_val):
+    belle_val_tmp = os.path.join(DATA_DIR, "belle_val_tmp.parquet")
+    if os.path.exists(belle_train) and os.path.exists(belle_val_tmp):
         print(f"Data: Belle already prepared at {DATA_DIR}")
     else:
         belle_raw = os.path.join(DATA_DIR, "belle_raw.parquet")
@@ -129,10 +136,8 @@ def download_data(num_python_shards=10, download_workers=8):
         if not ok:
             print("ERROR: failed to download Belle parquet")
             sys.exit(1)
-        # Split into train + val
         pf = pq.ParquetFile(belle_raw)
         table = pf.read()
-        # Build text column: "Human: {instruction}\nAssistant: {output}"
         instructions = table.column("instruction").to_pylist()
         outputs = table.column("output").to_pylist()
         texts = [f"Human: {i}\nAssistant: {o}" for i, o in zip(instructions, outputs)]
@@ -140,13 +145,14 @@ def download_data(num_python_shards=10, download_workers=8):
         text_table = pa.table({"text": text_col})
         val_size = 2000
         pq.write_table(text_table.slice(0, len(texts) - val_size), belle_train)
-        pq.write_table(text_table.slice(len(texts) - val_size), belle_val)
-        os.remove(belle_raw)  # 删除原始文件，避免被 list_parquet_files 扫到
+        pq.write_table(text_table.slice(len(texts) - val_size), belle_val_tmp)
+        os.remove(belle_raw)
         print(f"Data: Belle split → {len(texts)-val_size} train + {val_size} val rows")
 
     # --- Glaive function calling v2 ---
     glaive_train = os.path.join(DATA_DIR, "glaive_train.parquet")
-    if os.path.exists(glaive_train):
+    glaive_val_tmp = os.path.join(DATA_DIR, "glaive_val_tmp.parquet")
+    if os.path.exists(glaive_train) and os.path.exists(glaive_val_tmp):
         print(f"Data: Glaive already prepared at {DATA_DIR}")
     else:
         glaive_raw = os.path.join(DATA_DIR, "glaive_raw.parquet")
@@ -156,12 +162,72 @@ def download_data(num_python_shards=10, download_workers=8):
             print("WARNING: failed to download Glaive parquet, skipping")
         else:
             table = pq.read_table(glaive_raw)
-            # 'chat' column contains the full conversation as text
             chats = table.column("chat").to_pylist()
-            text_table = pa.table({"text": pa.array(chats, type=pa.string())})
-            pq.write_table(text_table, glaive_train)
+            val_size = 1000
+            train_texts = pa.array(chats[:-val_size], type=pa.string())
+            val_texts = pa.array(chats[-val_size:], type=pa.string())
+            pq.write_table(pa.table({"text": train_texts}), glaive_train)
+            pq.write_table(pa.table({"text": val_texts}), glaive_val_tmp)
             os.remove(glaive_raw)
-            print(f"Data: Glaive → {len(chats)} train rows")
+            print(f"Data: Glaive → {len(chats)-val_size} train + {val_size} val rows")
+
+    # --- Merge val shards ---
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    if not os.path.exists(val_path):
+        tables = []
+        for tmp in [belle_val_tmp, glaive_val_tmp]:
+            if os.path.exists(tmp):
+                tables.append(pq.read_table(tmp))
+        if tables:
+            import pyarrow as pa_local
+            merged = pa_local.concat_tables(tables)
+            pq.write_table(merged, val_path)
+            print(f"Data: val.parquet → {merged.num_rows} rows (Belle + Glaive mixed)")
+
+    # --- Belle 2M CN ---
+    belle2m_done = os.path.join(DATA_DIR, "belle2m_done.flag")
+    if os.path.exists(belle2m_done):
+        print(f"Data: Belle 2M already prepared at {DATA_DIR}")
+    else:
+        print(f"Data: downloading Belle 2M CN ({BELLE_2M_NUM_SHARDS} shards)...")
+        all_ok = True
+        for i in range(BELLE_2M_NUM_SHARDS):
+            shard_path = os.path.join(DATA_DIR, f"belle2m_{i:04d}.parquet")
+            if os.path.exists(shard_path):
+                continue
+            url = f"{BELLE_2M_BASE_URL}/{i:04d}.parquet"
+            raw_path = shard_path + ".raw"
+            ok = _fetch_url(url, raw_path)
+            if not ok:
+                print(f"WARNING: failed to download Belle 2M shard {i}, skipping")
+                all_ok = False
+                continue
+            table = pq.read_table(raw_path)
+            instructions = table.column("instruction").to_pylist()
+            outputs = table.column("output").to_pylist()
+            texts = [f"Human: {ins}\nAssistant: {out}" for ins, out in zip(instructions, outputs)]
+            pq.write_table(pa.table({"text": pa.array(texts, type=pa.string())}), shard_path)
+            os.remove(raw_path)
+            print(f"  Belle 2M shard {i}: {len(texts)} rows")
+        if all_ok:
+            open(belle2m_done, "w").close()
+
+    # --- Glaive function calling v1 ---
+    glaive_v1_train = os.path.join(DATA_DIR, "glaive_v1_train.parquet")
+    if os.path.exists(glaive_v1_train):
+        print(f"Data: Glaive v1 already prepared at {DATA_DIR}")
+    else:
+        glaive_v1_raw = os.path.join(DATA_DIR, "glaive_v1_raw.parquet")
+        print("Data: downloading Glaive function-calling-v1...")
+        ok = _fetch_url(GLAIVE_V1_PARQUET_URL, glaive_v1_raw)
+        if not ok:
+            print("WARNING: failed to download Glaive v1 parquet, skipping")
+        else:
+            table = pq.read_table(glaive_v1_raw)
+            chats = table.column("sample").to_pylist()
+            pq.write_table(pa.table({"text": pa.array(chats, type=pa.string())}), glaive_v1_train)
+            os.remove(glaive_v1_raw)
+            print(f"Data: Glaive v1 → {len(chats)} train rows")
 
     # --- GitHub Python ---
     num_shards = min(num_python_shards, PYTHON_MAX_SHARD + 1)
