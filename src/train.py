@@ -5,26 +5,85 @@ Usage: uv run train.py
 """
 
 import os
+import sys
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+for _proxy_key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"]:
+    os.environ.pop(_proxy_key, None)
+
+# Tee stdout to run.log
+class _Tee:
+    def __init__(self, *files): self.files = files
+    def write(self, s):
+        for f in self.files: f.write(s)
+    def flush(self):
+        for f in self.files: f.flush()
+_log_file = open("run.log", "w")
+sys.stdout = _Tee(sys.__stdout__, _log_file)
+sys.stderr = _Tee(sys.__stderr__, _log_file)
 
 import gc
 import math
 import time
-from dataclasses import dataclass, asdict
+from contextlib import nullcontext
+from dataclasses import dataclass, asdict, fields
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+from attention_window import build_causal_window_mask
+
+try:
+    from kernels import get_kernel
+except ImportError:
+    get_kernel = None
+
+
+def _load_flash_attention_backend():
+    if not torch.cuda.is_available() or get_kernel is None:
+        return None
+    cap = torch.cuda.get_device_capability()
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    try:
+        return get_kernel(repo).flash_attn_interface
+    except Exception:
+        return None
+
+
+def autocast_context(device):
+    if device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def model_dtype_for_device(device):
+    return torch.bfloat16 if device.type == "cuda" else torch.float32
+
+
+def maybe_cuda_synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def maybe_empty_cache(device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def peak_vram_mb(device):
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024 / 1024
+    return 0.0
+
+
+fa3 = _load_flash_attention_backend()
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET as _TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-TIME_BUDGET = 1800  # override: 30 minutes instead of 5
+TIME_BUDGET = 86400 # 24h ceiling (early stopping will terminate sooner)
+TOTAL_STEPS = 6000  # step-based schedule target (progress = step / TOTAL_STEPS)
+EVAL_INTERVAL = 500      # steps between val evaluations
+EARLY_STOP_PATIENCE = 3  # stop after N evals with no improvement
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -39,6 +98,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    rope_theta: float = 10000.0
 
 
 def norm(x):
@@ -91,7 +151,26 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if hasattr(fa3, 'flash_attn_func') and fa3.flash_attn_func is not None and q.is_cuda:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # CPU fallback or non-FlashAttn environment
+            q_sdpa = q.transpose(1, 2) # (B, H, T, D)
+            k_sdpa = k.transpose(1, 2)
+            v_sdpa = v.transpose(1, 2)
+
+            mask_rows = build_causal_window_mask(q.size(1), window_size)
+            attn_mask = None
+            if mask_rows is not None:
+                attn_mask = torch.tensor(mask_rows, device=q.device, dtype=torch.bool)
+
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                attn_mask=attn_mask,
+                is_causal=(attn_mask is None), # 如果手动提供了滑动窗口掩码，则关闭内置 causal
+                enable_gqa=(self.n_head != self.n_kv_head),
+            )
+            y = y.transpose(1, 2) # (B, T, H, D)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -116,9 +195,25 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
+    def forward_attn(self, x, ve, cos_sin, window_size):
+        """Attn with residual (standard use)."""
+        return x + self.attn(norm(x), ve, cos_sin, window_size)
+
+    def forward_mlp(self, x):
+        """MLP with residual (standard use)."""
+        return x + self.mlp(norm(x))
+
+    def forward_attn_only(self, h, ve, cos_sin, window_size):
+        """Attn without residual: paper AttnRes mode (h already is the attended state)."""
+        return self.attn(norm(h), ve, cos_sin, window_size)
+
+    def forward_mlp_only(self, h):
+        """MLP without residual: paper AttnRes mode."""
+        return self.mlp(norm(h))
+
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        x = self.forward_attn(x, ve, cos_sin, window_size)
+        x = self.forward_mlp(x)
         return x
 
 
@@ -132,8 +227,13 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Block AttnRes: cross-layer attention residual (Kimi 2026, Block variant, exact paper design)
+        # Exact paper design: proj is Linear(n_embd->1) used as pseudo-query; K=RMSNorm(V), no separate K projection
+        # 2*n_layer projections: even indices for pre-attn, odd indices for pre-mlp
+        sublayers_per_block = 3  # sublayers per block → N=8 blocks for L=24 (paper §3.2: N=8)
+        self.attnres_proj = nn.ModuleList([nn.Linear(config.n_embd, 1, bias=False) for _ in range(2 * config.n_layer)])
+        self.attnres_norm = nn.ModuleList([nn.RMSNorm(config.n_embd) for _ in range(2 * config.n_layer)])  # paper: per-sublayer independent RMSNorm
+        self.sublayers_per_block = sublayers_per_block
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -148,7 +248,7 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
-    def init_weights(self):
+    def init_weights(self, *, cast_embeddings_to_bfloat16=True):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
@@ -162,9 +262,6 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
         # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
@@ -176,12 +273,17 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        # AttnRes pseudo-query projections: zero init ensures uniform initial attention (paper §5)
+        for proj in self.attnres_proj:
+            torch.nn.init.zeros_(proj.weight)
+        if cast_embeddings_to_bfloat16:
+            self.transformer.wte.to(dtype=torch.bfloat16)
+            for ve in self.value_embeds.values():
+                ve.to(dtype=torch.bfloat16)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=None, device=None):
+        if base is None:
+            base = self.config.rope_theta
         if device is None:
             device = self.transformer.wte.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -198,7 +300,7 @@ class GPT(nn.Module):
         assert all(c in "SL" for c in pattern)
         long_window = config.sequence_len
         short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        char_to_window = {"L": (-1, -1), "S": (short_window, 0)}
         window_sizes = []
         for layer_idx in range(config.n_layer):
             char = pattern[layer_idx % len(pattern)]
@@ -210,15 +312,14 @@ class GPT(nn.Module):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        nparams_exclude = self.transformer.wte.weight.numel() + value_embeds_numel
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
+            effective_seq = t if window < 0 else min(window + 1, t)
             attn_flops += 12 * h * q * effective_seq
         return 6 * (nparams - nparams_exclude) + attn_flops
 
@@ -227,11 +328,11 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        attnres = sum(p.numel() for p in list(self.attnres_proj.parameters()) + list(self.attnres_norm.parameters()))
+        total = wte + value_embeds + lm_head + transformer_matrices + attnres
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+            'transformer_matrices': transformer_matrices, 'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
@@ -241,10 +342,11 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
+        attnres_proj_params = list(self.attnres_proj.parameters())
+        attnres_norm_params = list(self.attnres_norm.parameters())
+        attnres_params = attnres_proj_params + attnres_norm_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(attnres_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -252,8 +354,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=attnres_proj_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=attnres_norm_params, lr=0.15, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -273,11 +375,49 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        x0 = x
+        C = self.config.n_embd
+        bs = self.sublayers_per_block
+
+        def block_attn_res(completed_blocks, partial_block, proj_idx):
+            """Paper Fig.2: attend over completed blocks + partial block (if any), return h."""
+            if bs == 0:
+                # AttnRes disabled (control group): return partial_block as-is (pure residual)
+                return partial_block
+            all_v = completed_blocks + ([partial_block] if partial_block is not None else [])
+            if not all_v:
+                # first sub-layer of first block: partial_block is always x here, return it
+                return partial_block
+            V = torch.stack(all_v, dim=0)               # (N, B, T, C)
+            K = self.attnres_norm[proj_idx](V).to(V.dtype) # K = per-sublayer RMSNorm(V)
+            proj_w = self.attnres_proj[proj_idx].weight[0].to(V.dtype)  # (C,)
+            logits = torch.einsum('c,nbtc->nbt', proj_w, K)
+            attn_w = logits.float().softmax(dim=0).to(V.dtype)
+            return torch.einsum('nbt,nbtc->btc', attn_w, V)
+
+        # Full grad flow: no detach anywhere (paper-exact).
+        completed_blocks = []  # no detach: full grad flow
+        partial_block = x      # b0 = token embedding (first block starts from embedding)
+        sub_layer_count = 0
+
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+
+            # block boundary BEFORE attn (paper Fig.2 line 22-25)
+            if bs > 0 and sub_layer_count % bs == 0 and sub_layer_count > 0:
+                completed_blocks.append(partial_block)  # no detach: full grad flow
+                partial_block = None  # paper: new block starts fresh, first attn_out becomes partial
+
+            h = block_attn_res(completed_blocks, partial_block, proj_idx=2*i)
+            attn_out = block.forward_attn_only(h, ve, cos_sin, self.window_sizes[i])
+            sub_layer_count += 1
+            partial_block = attn_out if partial_block is None else partial_block + attn_out
+
+            h = block_attn_res(completed_blocks, partial_block, proj_idx=2*i+1)
+            mlp_out = block.forward_mlp_only(h)
+            sub_layer_count += 1
+            partial_block = partial_block + mlp_out
+            x = partial_block
+
         x = norm(x)
 
         softcap = 15
@@ -406,7 +546,7 @@ class MuonAdamW(torch.optim.Optimizer):
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_grads = torch.stack([p.grad if p.grad is not None else torch.zeros_like(p) for p in params])
         stacked_params = torch.stack(params)
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
@@ -431,25 +571,26 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 80       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SL"  # sliding window pattern: L=full, S=half context
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO (depth=12 → 768d)
+HEAD_DIM = 64           # target head dimension for attention
+KV_HEADS = None         # number of KV heads for GQA (None = same as n_head = MHA)
+WINDOW_PATTERN = "SSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.42     # learning rate for token embeddings (Adam)
+EMBEDDING_LR = 0.2      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.055       # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+SCALAR_LR = 0.1         # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.01     # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.1  # final LR as fraction of initial
+WARMDOWN_RATIO = 0.6    # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = 0.05 # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 16  # per-device batch size (4090: 128 OOMs)
+DEPTH = 12              # depth=12, AR=64 → 768d, ~6GB base + ~2-3GB AttnRes graph
+DEVICE_BATCH_SIZE = 16  # fits with no-detach at AR=64
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -457,10 +598,11 @@ DEVICE_BATCH_SIZE = 16  # per-device batch size (4090: 128 OOMs)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model_dtype = model_dtype_for_device(device)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -473,7 +615,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=KV_HEADS if KV_HEADS is not None else num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
@@ -483,7 +625,7 @@ print(f"Model config: {asdict(config)}")
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
-model.init_weights()
+model.init_weights(cast_embeddings_to_bfloat16=(device.type == "cuda"))
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -506,15 +648,16 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if os.environ.get("NO_COMPILE") != "1" and device.type == "cuda":
+    model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+# Schedules (all based on progress = step / TOTAL_STEPS)
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -540,20 +683,22 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+best_val_bpb = float('inf')
+no_improve_count = 0
 
 while True:
-    torch.cuda.synchronize()
+    maybe_cuda_synchronize(device)
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
+        with autocast_context(device):
             loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    # Progress and schedules (step-based so warmdown triggers correctly)
+    progress = min(step / TOTAL_STEPS, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -572,7 +717,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    maybe_cuda_synchronize(device)
     t1 = time.time()
     dt = t1 - t0
 
@@ -585,7 +730,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 0.0 if device.type != "cuda" else 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -600,6 +745,25 @@ while True:
 
     step += 1
 
+    # Periodic val eval + early stopping
+    if step % EVAL_INTERVAL == 0:
+        maybe_empty_cache(device)
+        with torch.no_grad(), autocast_context(device):
+            current_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
+        print(f"\nstep {step} eval val_bpb={current_bpb:.6f}")
+        if current_bpb < best_val_bpb:
+            best_val_bpb = current_bpb
+            no_improve_count = 0
+            # Save best checkpoint immediately
+            best_ckpt = {'model_state': model.state_dict(), 'config': asdict(config), 'val_bpb': current_bpb, 'step': step}
+            torch.save(best_ckpt, 'best_checkpoint.pt')
+            print(f"best_checkpoint.pt saved: val_bpb={current_bpb:.6f} at step {step}")
+        else:
+            no_improve_count += 1
+            if no_improve_count >= EARLY_STOP_PATIENCE:
+                print(f"Early stopping at step {step}: no improvement for {EARLY_STOP_PATIENCE} evals")
+                break
+
     # Time's up — but only stop after warmup steps so we don't count compilation
     if step > 10 and total_training_time >= TIME_BUDGET:
         break
@@ -609,15 +773,20 @@ print()  # newline after \r training log
 total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
+del optimizer  # free optimizer states before eval
+gc.collect()
 model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+maybe_empty_cache(device)
+with torch.no_grad(), autocast_context(device):
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+if device.type != "cuda":
+    steady_state_mfu = 0
+peak_vram_mb = peak_vram_mb(device)
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
@@ -629,3 +798,38 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+# Save checkpoint
+ckpt = {
+    'model_state': model.state_dict(),
+    'config': asdict(config),
+    'val_bpb': val_bpb,
+    'step': step,
+}
+torch.save(ckpt, 'checkpoint.pt')
+print("checkpoint saved to checkpoint.pt")
+
+# Save best checkpoint if improved
+import os
+best_bpb = float('inf')
+if os.path.exists('best_checkpoint.pt'):
+    best_ckpt = torch.load('best_checkpoint.pt', map_location='cpu', weights_only=False)
+    best_bpb = best_ckpt.get('val_bpb', float('inf'))
+if val_bpb < best_bpb:
+    torch.save(ckpt, 'best_checkpoint.pt')
+    print(f"best_checkpoint.pt updated: {best_bpb:.6f} -> {val_bpb:.6f}")
+else:
+    print(f"best_checkpoint.pt unchanged (best={best_bpb:.6f}, current={val_bpb:.6f})")
+
+# Append result to results.tsv
+import subprocess
+try:
+    commit = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], text=True).strip()
+except Exception:
+    commit = '-'
+results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results.tsv')
+with open(results_path, 'a') as f:
+    f.write(f"{commit}\t{val_bpb:.6f}\t{peak_vram_mb/1024:.1f}\t-\t"
+            f"AttnRes spb={model.sublayers_per_block if hasattr(model, 'sublayers_per_block') else '?'} "
+            f"emb_lr={EMBEDDING_LR} scalar_lr={SCALAR_LR} final_lr_frac={FINAL_LR_FRAC} "
+            f"steps={step} depth={DEPTH} ar={ASPECT_RATIO}\n")
