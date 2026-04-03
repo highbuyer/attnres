@@ -18,6 +18,19 @@ TOOL_MARKUP = (
     "<|tool_name_search_code|>",
     "<|tool_name_read_file|>",
 )
+SEARCH_CODE_PRIORITY_PREFIXES = (
+    "src/",
+    "scripts/",
+    "tests/",
+    "docs/",
+)
+SEARCH_CODE_DEPRIORITIZED_PATHS = (
+    "scripts/build_tool_call_data.py",
+    "scripts/eval_tool_format.py",
+    "scripts/inspect_tool_start_logits.py",
+    "scripts/tool_call_samples",
+    "docs/tool_call_samples",
+)
 
 
 def extract_tool_result(messages: list[dict]) -> str | None:
@@ -72,6 +85,72 @@ def parse_tool_call(text: str) -> tuple[str, dict] | None:
     return parsed_call
 
 
+def _normalize_search_result_path(line: str) -> tuple[str, int]:
+    path_part, _, remainder = line.partition(":")
+    normalized = path_part.removeprefix("./")
+    line_no, _, _ = remainder.partition(":")
+    try:
+        parsed_line_no = int(line_no)
+    except ValueError:
+        parsed_line_no = 0
+    return normalized, parsed_line_no
+
+
+def _normalize_search_result_line(line: str) -> str:
+    path_part, sep, remainder = line.partition(":")
+    if not sep:
+        return line
+    return f"{path_part.removeprefix('./')}:{remainder}"
+
+
+def _search_code_sort_key(line: str) -> tuple[int, int, str]:
+    path, line_no = _normalize_search_result_path(line)
+    if any(path.startswith(prefix) for prefix in SEARCH_CODE_DEPRIORITIZED_PATHS):
+        priority = len(SEARCH_CODE_PRIORITY_PREFIXES)
+    else:
+        priority = len(SEARCH_CODE_PRIORITY_PREFIXES) + 1
+        for idx, prefix in enumerate(SEARCH_CODE_PRIORITY_PREFIXES):
+            if path.startswith(prefix):
+                priority = idx
+                break
+        if priority == len(SEARCH_CODE_PRIORITY_PREFIXES) + 1 and (path.endswith(".py") or path.endswith(".toml")):
+            priority = len(SEARCH_CODE_PRIORITY_PREFIXES) - 1
+    return priority, line_no, path
+
+
+def _search_code_results(query: str, work_dir: str | Path) -> list[str]:
+    result = subprocess.run(
+        [
+            "rg",
+            "--no-heading",
+            "-n",
+            "--max-count",
+            "200",
+            "--sort",
+            "path",
+            "--fixed-strings",
+            "--glob",
+            "*.py",
+            "--glob",
+            "*.md",
+            "--glob",
+            "*.toml",
+            "--glob",
+            "*.txt",
+            "--",
+            query,
+            ".",
+        ],
+        capture_output=True,
+        cwd=str(work_dir),
+        text=True,
+        timeout=5,
+    )
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    lines.sort(key=_search_code_sort_key)
+    return [_normalize_search_result_line(line) for line in lines[:10]]
+
+
 def execute_tool(tool_name: str, params: dict, work_dir: str | Path) -> str:
     work_dir = str(work_dir)
     try:
@@ -79,32 +158,7 @@ def execute_tool(tool_name: str, params: dict, work_dir: str | Path) -> str:
             query = params.get("query", "")
             if not query:
                 return "(空查询)"
-            result = subprocess.run(
-                [
-                    "rg",
-                    "--no-heading",
-                    "-n",
-                    "--max-count",
-                    "10",
-                    "--sort",
-                    "path",
-                    "--glob",
-                    "*.py",
-                    "--glob",
-                    "*.md",
-                    "--glob",
-                    "*.toml",
-                    "--glob",
-                    "*.txt",
-                    query,
-                    ".",
-                ],
-                capture_output=True,
-                cwd=work_dir,
-                text=True,
-                timeout=5,
-            )
-            output = result.stdout.strip()
+            output = "\n".join(_search_code_results(query, work_dir))
             return output if output else f"(未找到匹配: {query})"
 
         if tool_name == "read_file":

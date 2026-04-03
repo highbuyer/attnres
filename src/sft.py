@@ -1,110 +1,455 @@
+#!/usr/bin/env python3
+"""SFT fine-tuning script."""
+
 from __future__ import annotations
 
-import os
-import sys
-os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
-import math
-import time
-import random
 import argparse
+import json
+import math
+import os
+import random
+import shutil
+import sys
+import time
+import types
+from contextlib import nullcontext
+from dataclasses import asdict, fields
 from pathlib import Path
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from project_paths import resolve_sft_data_path, resolve_sft_input_checkpoint
+from sft_format import included_turn_indices
 
-from train import GPT, GPTConfig, Tokenizer, make_dataloader, load_checkpoint, save_best_artifacts, best_alias_path, best_metadata_path
-
-# ---------------------------------------------------------------------------
-# Settings & Hyperparameters
-# ---------------------------------------------------------------------------
-CHECKPOINT_IN = 'best_checkpoint.pt'
-CHECKPOINT_OUT = 'sft_checkpoint.pt'
-DATA_PATH = 'data/sft_data.jsonl'
 
 MAX_SEQ_LEN = 2048
 DEVICE_BATCH_SIZE = 4
 GRAD_ACCUM = 8
-TOTAL_STEPS = 1000
-WARMUP_STEPS = 100
-WARMDOWN_START = 800
-LR = 2e-5
 FINAL_LR_FRAC = 0.1
-EVAL_INTERVAL = 100
+VAL_RATIO = 0.05
 SEED = 42
+SYSTEM_PROMPT = "你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。"
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
-args = parser.parse_args()
+GPT = None
+GPTConfig = None
+tokenizer = None
+enc = None
+BOS_ID = None
+USER_ID = None
+ASST_ID = None
+EOS_ID = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SFT fine-tuning")
+    parser.add_argument("checkpoint", type=str, nargs="?", default=None, help="Input checkpoint path")
+    parser.add_argument("--out", "-o", type=str, default=None, help="Output checkpoint path")
+    parser.add_argument("--data", type=str, default=None, help="SFT data JSONL path")
+    parser.add_argument("--resume", action="store_true", help="Resume SFT from a prior SFT checkpoint")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--total-steps", type=int, default=None, help="Total training steps override")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Warmup steps override")
+    parser.add_argument("--warmdown-start", type=int, default=None, help="Warmdown start step override")
+    parser.add_argument("--eval-interval", type=int, default=None, help="Validation interval override")
+    return parser.parse_args()
+
+
+def _ensure_model_defs() -> None:
+    global GPT, GPTConfig
+    if GPT is not None and GPTConfig is not None:
+        return
+
+    src_dir = Path(__file__).resolve().parent
+    sys.path.insert(0, str(src_dir))
+    lines = (src_dir / "train.py").read_text(encoding="utf-8").splitlines(keepends=True)
+    cut = next(i for i, line in enumerate(lines) if "# Setup: tokenizer, model, optimizer, dataloader" in line)
+    src = "".join(lines[:cut])
+
+    fake = types.ModuleType("prepare")
+    fake.MAX_SEQ_LEN = MAX_SEQ_LEN
+    fake.TIME_BUDGET = 999999
+    fake.Tokenizer = None
+    fake.make_dataloader = None
+    fake.evaluate_bpb = None
+    sys.modules["prepare"] = fake
+    try:
+        ns: dict[str, object] = {}
+        exec(compile(src, "train.py", "exec"), ns)
+    finally:
+        del sys.modules["prepare"]
+
+    GPT = ns["GPT"]
+    GPTConfig = ns["GPTConfig"]
+
+    import __main__
+
+    __main__.GPT = GPT
+    __main__.GPTConfig = GPTConfig
+    GPT.__module__ = "__main__"
+    GPTConfig.__module__ = "__main__"
+
+
+def _ensure_tokenizer() -> None:
+    global tokenizer, enc, BOS_ID, USER_ID, ASST_ID, EOS_ID
+    if tokenizer is not None:
+        return
+
+    _ensure_model_defs()
+    from prepare import Tokenizer
+
+    tokenizer = Tokenizer.from_directory()
+    enc = tokenizer.enc
+    BOS_ID = enc.encode_single_token("<|reserved_0|>")
+    USER_ID = enc.encode_single_token("<|reserved_1|>")
+    ASST_ID = enc.encode_single_token("<|reserved_2|>")
+    EOS_ID = enc.encode_single_token("<|reserved_3|>")
+
+
+def _config_from_ckpt(raw_config):
+    _ensure_model_defs()
+    if isinstance(raw_config, dict):
+        allowed = {field.name for field in fields(GPTConfig)}
+        return GPTConfig(**{key: value for key, value in raw_config.items() if key in allowed})
+    return raw_config
+
+
+def _config_to_ckpt(config):
+    return asdict(config)
+
+
+def load_checkpoint(path, device):
+    import torch
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt["config"] = _config_from_ckpt(ckpt["config"])
+    return ckpt
+
+
+def save_checkpoint(path, ckpt):
+    import torch
+
+    ckpt = dict(ckpt)
+    ckpt["config"] = _config_to_ckpt(ckpt["config"])
+    torch.save(ckpt, path)
+
+
+def best_alias_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path.with_name(f"{path.stem}_best{path.suffix}")
+
+
+def best_metadata_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path.with_name(f"{path.stem}_best.json")
+
+
+def save_best_artifacts(path, ckpt):
+    save_checkpoint(path, ckpt)
+
+    alias = best_alias_path(path)
+    if alias != Path(path):
+        if alias.exists() or alias.is_symlink():
+            alias.unlink()
+        try:
+            os.link(path, alias)
+        except OSError:
+            shutil.copy2(path, alias)
+
+    meta = {
+        "checkpoint": str(Path(path)),
+        "best_alias": str(alias),
+        "step": int(ckpt["step"]),
+        "val_bpt": float(ckpt["val_bpt"]),
+        "best_val_bpt": float(ckpt.get("best_val_bpt", ckpt["val_bpt"])),
+    }
+    best_metadata_path(path).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def tokenize_turn(message):
+    _ensure_tokenizer()
+    content_ids = enc.encode(message["content"], allowed_special="all")
+    if message["role"] in ("user", "tool"):
+        return [USER_ID] + content_ids, [0] * (1 + len(content_ids))
+    return [ASST_ID] + content_ids, [0] + [1] * len(content_ids)
+
+
+def format_samples_split(messages):
+    _ensure_tokenizer()
+    if not messages:
+        return []
+
+    messages = list(messages)
+    if messages[0]["role"] == "system":
+        system_content = messages[0]["content"]
+        messages = messages[1:]
+        for idx, message in enumerate(messages):
+            if message["role"] == "user":
+                messages[idx] = {"role": "user", "content": system_content + "\n" + message["content"]}
+                break
+        else:
+            return []
+
+    if not messages or messages[0]["role"] != "user":
+        return []
+
+    messages[0] = {
+        "role": "user",
+        "content": SYSTEM_PROMPT + "\n" + messages[0]["content"],
+    }
+
+    turn_ids = []
+    turn_masks = []
+    for message in messages:
+        ids, mask = tokenize_turn(message)
+        turn_ids.append(ids)
+        turn_masks.append(mask)
+
+    samples = []
+    for idx, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+
+        ids = [BOS_ID]
+        mask = [0]
+        for turn_idx in included_turn_indices(messages, idx):
+            ids.extend(turn_ids[turn_idx])
+            mask.extend(turn_masks[turn_idx])
+        ids.append(EOS_ID)
+        mask.append(1)
+
+        if len(ids) > MAX_SEQ_LEN:
+            excess = len(ids) - MAX_SEQ_LEN
+            cut = 1 + excess
+            while cut < len(ids) - 1 and ids[cut] not in (USER_ID, ASST_ID):
+                cut += 1
+            ids = [BOS_ID] + ids[cut:]
+            mask = [0] + mask[cut:]
+
+        if sum(mask) == 0:
+            continue
+        samples.append((ids, mask))
+    return samples
+
+
+def build_datasets(data_path: str):
+    with open(data_path, encoding="utf-8") as handle:
+        raw = [json.loads(line) for line in handle]
+
+    random.seed(SEED)
+    random.shuffle(raw)
+
+    val_conv_n = max(1, int(len(raw) * VAL_RATIO))
+    val_raw = raw[:val_conv_n]
+    train_raw = raw[val_conv_n:]
+
+    train_data = [sample for record in train_raw for sample in format_samples_split(record["messages"])]
+    val_data = [sample for record in val_raw for sample in format_samples_split(record["messages"])]
+    return raw, train_data, val_data
+
 
 def make_batch(samples, device):
-    # Simplified mock for batching
-    x = torch.stack([torch.tensor(s['input_ids'], device=device) for s in samples])
-    y = torch.stack([torch.tensor(s['labels'], device=device) for s in samples])
-    msk = (y != -100).float()
-    return x, y, msk
+    import torch
+
+    max_len = max(len(sample[0]) for sample in samples)
+    input_ids = torch.zeros(len(samples), max_len, dtype=torch.long)
+    loss_mask = torch.zeros(len(samples), max_len - 1, dtype=torch.float)
+    for idx, (ids, mask) in enumerate(samples):
+        n_tokens = len(ids)
+        input_ids[idx, :n_tokens] = torch.tensor(ids, dtype=torch.long)
+        loss_mask[idx, :n_tokens - 1] = torch.tensor(mask[1:], dtype=torch.float)
+    x = input_ids[:, :-1].to(device)
+    y = input_ids[:, 1:].to(device)
+    loss_mask = loss_mask.to(device)
+    return x, y, loss_mask
+
+
+def autocast_context(device):
+    import torch
+
+    if device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
 
 def evaluate_sft(model, val_data, device):
+    import torch
+    import torch.nn.functional as F
+
     model.eval()
     total_loss = 0.0
     total_tokens = 0
     with torch.no_grad():
-        for i in range(0, len(val_data), DEVICE_BATCH_SIZE):
-            batch = val_data[i:i+DEVICE_BATCH_SIZE]
-            x, y, msk = make_batch(batch, device)
-            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
+        for idx in range(0, len(val_data), DEVICE_BATCH_SIZE):
+            batch = val_data[idx:idx + DEVICE_BATCH_SIZE]
+            x, y, loss_mask = make_batch(batch, device)
+            with autocast_context(device):
                 logits = model(x)
             logits = logits.float()
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction='none')
-            loss = (loss * msk.view(-1)).sum()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="none")
+            loss = (loss * loss_mask.view(-1)).sum()
             total_loss += loss.item()
-            total_tokens += msk.sum().item()
+            total_tokens += loss_mask.sum().item()
     model.train()
     return total_loss / max(total_tokens, 1) / math.log(2)
 
+
 def resolve_resume_state(ckpt: dict, resume: bool) -> tuple[int, float]:
     if not resume:
-        return 0, float('inf')
-    if 'optimizer_state' not in ckpt:
-        raise ValueError('Checkpoint does not contain optimizer_state, cannot resume')
-    resume_step = int(ckpt.get('step', 0))
-    best_val_bpt = float(ckpt.get('best_val_bpt', ckpt.get('val_bpt', float('inf'))))
+        return 0, float("inf")
+    if "optimizer_state" not in ckpt:
+        raise ValueError("Checkpoint does not contain optimizer_state, cannot resume")
+    resume_step = int(ckpt.get("step", 0))
+    best_val_bpt = float(ckpt.get("best_val_bpt", ckpt.get("val_bpt", float("inf"))))
     return resume_step, best_val_bpt
 
-def main():
-    torch.manual_seed(SEED)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Loading {CHECKPOINT_IN} on {device}...')
-    ckpt = load_checkpoint(CHECKPOINT_IN, device)
-    config = ckpt['config']
 
-    model = GPT(config).to(device=device, dtype=torch.bfloat16)
-    state = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state'].items()}
-    model.load_state_dict(state, strict=False)
-    model.to(dtype=torch.bfloat16)
+def main() -> None:
+    import torch
+    import torch.nn.functional as F
+
+    args = parse_args()
+
+    if args.checkpoint:
+        checkpoint_in = str(resolve_sft_input_checkpoint(args.checkpoint))
+        checkpoint_stem = Path(checkpoint_in).stem
+        checkpoint_out = args.out or f"sft_{checkpoint_stem}.pt"
+    else:
+        checkpoint_in = str(resolve_sft_input_checkpoint(None))
+        checkpoint_out = args.out or "sft_checkpoint.pt"
+
+    data_path = str(resolve_sft_data_path(args.data))
+    lr = args.lr or 1.5e-5
+    total_steps = args.total_steps or 15000
+    warmup_steps = args.warmup_steps or 100
+    warmdown_start = args.warmdown_start if args.warmdown_start is not None else int(total_steps * 0.8)
+    eval_interval = args.eval_interval or 500
+
+    _ensure_model_defs()
+    _ensure_tokenizer()
+    print(f"Special tokens: BOS={BOS_ID} USER={USER_ID} ASST={ASST_ID} EOS={EOS_ID}")
+
+    raw, train_data, val_data = build_datasets(data_path)
+    print(f"Formatted: {len(train_data) + len(val_data)} samples (from {len(raw)} raw conversations)")
+    print(f"Train: {len(train_data)}, Val: {len(val_data)}")
+
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+
+    print(f"Loading {checkpoint_in} on {device}...")
+    ckpt = load_checkpoint(checkpoint_in, device)
+    config = ckpt["config"]
+
+    model = GPT(config).to(device=device, dtype=model_dtype)
+    state = {key.replace("_orig_mod.", ""): value for key, value in ckpt["model_state"].items()}
+    load_result = model.load_state_dict(state, strict=False)
+    if load_result.missing_keys:
+        print(f"WARNING: missing keys: {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"WARNING: unexpected keys: {load_result.unexpected_keys}")
+    model.to(dtype=model_dtype)
 
     head_dim = config.n_embd // config.n_head
     cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
-    model.cos, model.sin = cos.to(torch.bfloat16), sin.to(torch.bfloat16)
+    model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.01)
-    autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+    metric_key = "val_bpt" if "val_bpt" in ckpt else "val_bpb"
+    print(f"Checkpoint {checkpoint_in}: {metric_key}={ckpt[metric_key]:.4f}, step={ckpt['step']}")
 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
     resume_step, best_val_bpt = resolve_resume_state(ckpt, args.resume)
     if args.resume:
-        optimizer.load_state_dict(ckpt['optimizer_state'])
-        print(f'Resuming SFT from step {resume_step} (best_val_bpt={best_val_bpt:.4f})')
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        print(f"Resuming SFT from step {resume_step} (best_val_bpt={best_val_bpt:.4f})")
 
-    # Mock data load
-    train_data, val_data = [], [] # Should load from DATA_PATH
-    
     model.train()
     random.seed(SEED + 1)
     step = resume_step
+
+    print("SFT config:")
+    print(f"  Input:  {checkpoint_in}")
+    print(f"  Output: {checkpoint_out}")
+    print(f"  Data:   {data_path}")
+    print(f"  LR:     {lr}")
+    print(f"  Steps:  total={total_steps} warmup={warmup_steps} warmdown={warmdown_start} eval={eval_interval}")
+    print(f"Starting SFT: {total_steps} steps, lr={lr}, batch={DEVICE_BATCH_SIZE * GRAD_ACCUM}")
+    print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}")
+
+    train_idx = list(range(len(train_data)))
+    random.shuffle(train_idx)
+    idx_ptr = 0
+
+    def next_batch():
+        nonlocal train_idx, idx_ptr
+        batch_indices = []
+        while len(batch_indices) < DEVICE_BATCH_SIZE:
+            if idx_ptr >= len(train_idx):
+                random.shuffle(train_idx)
+                idx_ptr = 0
+            batch_indices.append(train_idx[idx_ptr])
+            idx_ptr += 1
+        return [train_data[i] for i in batch_indices]
+
     t0 = time.time()
+    while step < total_steps:
+        if step < warmup_steps:
+            current_lr = lr * (step + 1) / warmup_steps
+        elif step >= warmdown_start:
+            frac = (step - warmdown_start) / max(1, total_steps - warmdown_start)
+            current_lr = lr * (1 - frac * (1 - FINAL_LR_FRAC))
+        else:
+            current_lr = lr
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
 
-    # Training loop removed for brevity in display, but functionally identical in file
-    print("SFT script ready for execution.")
+        optimizer.zero_grad()
+        accum_loss = 0.0
+        accum_tokens = 0
 
-if __name__ == '__main__':
+        for _ in range(GRAD_ACCUM):
+            batch = next_batch()
+            x, y, loss_mask = make_batch(batch, device)
+            with autocast_context(device):
+                logits = model(x)
+            logits = logits.float()
+            loss_per_tok = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="none")
+            masked_loss = (loss_per_tok * loss_mask.view(-1)).sum() / (loss_mask.sum() + 1e-8)
+            (masked_loss / GRAD_ACCUM).backward()
+            accum_loss += masked_loss.item()
+            accum_tokens += int(loss_mask.sum().item())
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        step += 1
+
+        dt = time.time() - t0
+        t0 = time.time()
+        print(
+            f"step {step:04d}/{total_steps} | loss={accum_loss / GRAD_ACCUM:.4f} | "
+            f"lr={current_lr:.2e} | tok={accum_tokens} | dt={dt * 1000:.0f}ms"
+        )
+
+        if step % eval_interval == 0:
+            val_bpt = evaluate_sft(model, val_data, device)
+            print(f"  VAL step {step}: bits/tok={val_bpt:.4f}")
+            if val_bpt < best_val_bpt:
+                best_val_bpt = val_bpt
+                ckpt_out = {
+                    "model_state": model.state_dict(),
+                    "config": ckpt["config"],
+                    "val_bpt": val_bpt,
+                    "best_val_bpt": best_val_bpt,
+                    "step": step,
+                    "sft": True,
+                    "optimizer_state": optimizer.state_dict(),
+                }
+                save_best_artifacts(checkpoint_out, ckpt_out)
+                print(f"  Saved {checkpoint_out}: val_bpt={val_bpt:.4f}")
+                print(f"  Updated {best_alias_path(checkpoint_out)} and {best_metadata_path(checkpoint_out)}")
+
+    print(f"SFT done. Best val_bpt={best_val_bpt:.4f}")
+
+
+if __name__ == "__main__":
     main()

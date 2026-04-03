@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import types
+from contextlib import nullcontext
 from dataclasses import asdict, fields
 from pathlib import Path
 
@@ -106,7 +107,8 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 print(f'Loading {CHECKPOINT_IN}...')
@@ -118,18 +120,18 @@ _metric_key = 'val_bpt' if 'val_bpt' in ckpt else 'val_bpb'
 print(f'Checkpoint: {_metric_key}={ckpt[_metric_key]:.6f}, step={ckpt["step"]}')
 
 # 构建模型并加载权重
-model = GPT(config).to(device=device, dtype=torch.bfloat16)
+model = GPT(config).to(device=device, dtype=model_dtype)
 state = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state'].items()}
 load_result = model.load_state_dict(state, strict=False)
 if load_result.missing_keys:
     print(f'WARNING: missing keys: {load_result.missing_keys}')
 if load_result.unexpected_keys:
     print(f'WARNING: unexpected keys: {load_result.unexpected_keys}')
-model.to(dtype=torch.bfloat16)
+model.to(dtype=model_dtype)
 
 head_dim = config.n_embd // config.n_head
 cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
-model.cos, model.sin = cos.to(torch.bfloat16), sin.to(torch.bfloat16)
+model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
 
 # ---------------------------------------------------------------------------
 # Tokenizer, optimizer, dataloader
@@ -153,10 +155,10 @@ optimizer = model.setup_optimizer(
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
-if os.environ.get('NO_COMPILE') != '1':
+if os.environ.get('NO_COMPILE') != '1' and device.type == 'cuda':
     model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)
 
 print(f'Gradient accumulation steps: {grad_accum_steps}')
@@ -193,7 +195,8 @@ best_val_bpb = float('inf')
 no_improve_count = 0
 
 while True:
-    torch.cuda.synchronize()
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -220,7 +223,8 @@ while True:
         print("FAIL: loss exploded")
         exit(1)
 
-    torch.cuda.synchronize()
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     if step > 10:
@@ -231,7 +235,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 0.0 if device.type != 'cuda' else 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch}    ", end="", flush=True)
 
@@ -244,9 +248,10 @@ while True:
 
     # 定期评估
     if step % EVAL_INTERVAL == 0:
-        torch.cuda.empty_cache()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         with torch.no_grad(), autocast_ctx:
-            current_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+            current_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
         print(f"\nstep {step} eval val_bpb={current_bpb:.6f}")
         if current_bpb < best_val_bpb:
             best_val_bpb = current_bpb
@@ -277,12 +282,13 @@ print()
 del optimizer
 gc.collect()
 model.eval()
-torch.cuda.empty_cache()
+if device.type == 'cuda':
+    torch.cuda.empty_cache()
 with torch.no_grad(), autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
 
 t_end = time.time()
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_vram_mb = 0.0 if device.type != 'cuda' else torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")

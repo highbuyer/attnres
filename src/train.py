@@ -36,8 +36,12 @@ from attention_window import build_causal_window_mask
 
 try:
     from kernels import get_kernel
+    from kernels.utils import get_local_kernel, install_kernel, select_revision_or_version
 except ImportError:
     get_kernel = None
+    get_local_kernel = None
+    install_kernel = None
+    select_revision_or_version = None
 
 
 def _load_flash_attention_backend():
@@ -45,6 +49,13 @@ def _load_flash_attention_backend():
         return None
     cap = torch.cuda.get_device_capability()
     repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    if install_kernel is not None and get_local_kernel is not None and select_revision_or_version is not None:
+        try:
+            revision = select_revision_or_version(repo, revision=None, version=None)
+            package_name, variant_path = install_kernel(repo, revision=revision, local_files_only=True)
+            return get_local_kernel(variant_path, package_name).flash_attn_interface
+        except FileNotFoundError:
+            pass
     try:
         return get_kernel(repo).flash_attn_interface
     except Exception:

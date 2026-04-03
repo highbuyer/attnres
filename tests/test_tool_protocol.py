@@ -37,6 +37,65 @@ class ToolProtocolTest(unittest.TestCase):
         )
         self.assertEqual(strip_tool_markup(transcript), "rope_theta 默认值是 10000。")
 
+    def test_search_code_treats_leading_dash_query_as_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = Path(tmp_dir) / "src"
+            src_dir.mkdir()
+            infer_path = src_dir / "infer.py"
+            infer_path.write_text(
+                'parser.add_argument("--tool-dir", type=str, default=".")\n',
+                encoding="utf-8",
+            )
+            result = execute_tool("search_code", {"query": "--tool-dir"}, tmp_dir)
+            self.assertEqual(result, 'src/infer.py:1:parser.add_argument("--tool-dir", type=str, default=".")')
+
+    def test_search_code_prioritizes_source_over_docs_and_generated_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = Path(tmp_dir) / "src"
+            docs_dir = Path(tmp_dir) / "docs"
+            scripts_dir = Path(tmp_dir) / "scripts"
+            src_dir.mkdir()
+            docs_dir.mkdir()
+            scripts_dir.mkdir()
+            (docs_dir / "INFER_README.md").write_text("rep-penalty docs mention\n", encoding="utf-8")
+            (scripts_dir / "build_tool_call_data.py").write_text("rep-penalty generated sample\n", encoding="utf-8")
+            (src_dir / "infer.py").write_text('parser.add_argument("--rep-penalty", type=float, default=1.3)\n', encoding="utf-8")
+            result = execute_tool("search_code", {"query": "rep-penalty"}, tmp_dir).splitlines()
+            self.assertTrue(result)
+            self.assertEqual(result[0], 'src/infer.py:1:parser.add_argument("--rep-penalty", type=float, default=1.3)')
+
+    def test_search_code_prioritizes_real_definition_over_generator_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = Path(tmp_dir) / "src"
+            scripts_dir = Path(tmp_dir) / "scripts"
+            src_dir.mkdir()
+            scripts_dir.mkdir()
+            (scripts_dir / "build_tool_call_data.py").write_text('("where", "search_code", {"query": "def validate_tool_sample"})\n', encoding="utf-8")
+            (src_dir / "tool_protocol.py").write_text("def validate_tool_sample(sample, work_dir):\n    return True\n", encoding="utf-8")
+            result = execute_tool("search_code", {"query": "def validate_tool_sample"}, tmp_dir).splitlines()
+            self.assertTrue(result)
+            self.assertEqual(result[0], "src/tool_protocol.py:1:def validate_tool_sample(sample, work_dir):")
+
+    def test_search_code_deprioritizes_prompt_holder_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            scripts_dir = Path(tmp_dir) / "scripts"
+            scripts_dir.mkdir()
+            (scripts_dir / "inspect_tool_start_logits.py").write_text(
+                '"scripts/make_sft_data.py 里有没有 tool-call-upsample 参数？"\n',
+                encoding="utf-8",
+            )
+            (scripts_dir / "eval_tool_format.py").write_text(
+                '"scripts/make_sft_data.py 里有没有 tool-call-upsample 参数？"\n',
+                encoding="utf-8",
+            )
+            (scripts_dir / "make_sft_data.py").write_text(
+                'parser.add_argument("--tool-call-upsample", type=int, default=10)\n',
+                encoding="utf-8",
+            )
+            result = execute_tool("search_code", {"query": "tool-call-upsample"}, tmp_dir).splitlines()
+            self.assertTrue(result)
+            self.assertEqual(result[0], 'scripts/make_sft_data.py:1:parser.add_argument("--tool-call-upsample", type=int, default=10)')
+
     def test_execute_read_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             file_path = Path(tmp_dir) / "demo.txt"
