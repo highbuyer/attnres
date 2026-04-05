@@ -107,7 +107,8 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+param_dtype = torch.float32
+compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
 H100_BF16_PEAK_FLOPS = 989.5e12
 
@@ -120,18 +121,18 @@ _metric_key = 'val_bpt' if 'val_bpt' in ckpt else 'val_bpb'
 print(f'Checkpoint: {_metric_key}={ckpt[_metric_key]:.6f}, step={ckpt["step"]}')
 
 # 构建模型并加载权重
-model = GPT(config).to(device=device, dtype=model_dtype)
+model = GPT(config).to(device=device, dtype=param_dtype)
 state = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state'].items()}
 load_result = model.load_state_dict(state, strict=False)
 if load_result.missing_keys:
     print(f'WARNING: missing keys: {load_result.missing_keys}')
 if load_result.unexpected_keys:
     print(f'WARNING: unexpected keys: {load_result.unexpected_keys}')
-model.to(dtype=model_dtype)
+model.to(dtype=param_dtype)
 
 head_dim = config.n_embd // config.n_head
 cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
-model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
+model.cos, model.sin = cos.to(compute_dtype), sin.to(compute_dtype)
 
 # ---------------------------------------------------------------------------
 # Tokenizer, optimizer, dataloader

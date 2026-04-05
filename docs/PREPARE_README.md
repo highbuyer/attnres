@@ -43,8 +43,12 @@ uv run python src/prepare.py --num-shards 20
 ## Tokenizer 训练
 
 - 数据来源：`text_iterator(max_chars=300_000_000)`
-- 词表大小：约 32768（8192 → 32768）
-- 特殊 token：4 个（reserved_0~3）
+- 词表大小：约 32768
+- 特殊 token：10 个
+  - `reserved_0~3`
+  - `tool_call_start` / `tool_call_end`
+  - `tool_result_start` / `tool_result_end`
+  - `tool_name_search_code` / `tool_name_read_file`
 
 ## 输出
 

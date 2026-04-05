@@ -3,12 +3,16 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+import importlib.util
 
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from attention_window import build_causal_window_mask  # noqa: E402
+
+
+HAS_TORCH = importlib.util.find_spec("torch") is not None
 
 
 class AttentionWindowTest(unittest.TestCase):
@@ -33,6 +37,16 @@ class AttentionWindowTest(unittest.TestCase):
             build_causal_window_mask(16, (4, 0)),
             build_causal_window_mask(16, (4, 0)),
         )
+
+    @unittest.skipUnless(HAS_TORCH, "torch is required for dtype alignment test")
+    def test_value_residual_dtype_alignment(self) -> None:
+        import torch
+
+        v = torch.zeros((1, 2, 3, 4), dtype=torch.bfloat16)
+        ve = torch.ones((1, 2, 3, 4), dtype=torch.float32)
+        gate = torch.ones((1, 2, 3), dtype=torch.float32)
+        mixed = v + gate.to(v.dtype).unsqueeze(-1) * ve.to(v.dtype)
+        self.assertEqual(mixed.dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

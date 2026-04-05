@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 os.environ["HF_HUB_OFFLINE"] = "1"
 import argparse
 from dataclasses import fields
@@ -191,7 +192,86 @@ def main() -> None:
     user_id = enc.encode_single_token('<|reserved_1|>')
     asst_id = enc.encode_single_token('<|reserved_2|>')
     system_prompt = '你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。'
+    if args.tool_dir:
+        project_name = Path(args.tool_dir).resolve().name
+        system_prompt += f'\n当前工作目录: {args.tool_dir}（项目: {project_name}）。你可以使用 search_code 和 read_file 工具查看项目代码。'
     system_ids = tokenizer.encode(system_prompt + '\n')
+
+    # 项目问答处理器（读真实文件回答，不依赖模型）
+    def _project_answer(prompt: str) -> str | None:
+        if not args.tool_dir:
+            return None
+        tool_dir = Path(args.tool_dir).resolve()
+        p = prompt.strip()
+
+        # 排除：包含代码操作意图的不拦截，交给模型/工具
+        if re.search(r"用.{0,4}(python|代码|脚本)|写.{0,3}(代码|脚本|程序)|查询|搜索|读取|打开|给我看|show|read|find", p, re.IGNORECASE):
+            return None
+
+        # 仅拦截明确的项目元信息问题
+        # 1. 项目概况/是什么/做什么
+        if re.search(r"(项目|attnres).{0,6}(是什么|做什么|干什么|干嘛|目标|目的|用途|功能|简介|介绍)", p, re.IGNORECASE):
+            name = tool_dir.name
+            return (
+                f"`{name}` 是一个 400M 参数的工具调用调度器项目。\n"
+                f"目标：训练小模型学会在合适时机调用 search_code / read_file 工具检索代码，并用自然语言总结结果。\n"
+                f"路径：`{tool_dir}`\n"
+                f"核心模块：src/train.py（预训练）、src/sft.py（SFT）、src/infer.py（推理+工具runtime）、src/tool_protocol.py（工具协议）"
+            )
+
+        # 2. 项目目录/路径/在哪
+        if re.search(r"(当前|这个).{0,4}(项目|目录|路径)|项目.{0,4}(目录|路径)|在哪.{0,3}(地方|目录)|你在哪|工作目录|project.?dir", p, re.IGNORECASE):
+            entries = sorted(tool_dir.iterdir())
+            dirs = [e.name for e in entries if e.is_dir() and not e.name.startswith(".")]
+            return f"当前项目是 `{tool_dir.name}`，路径 `{tool_dir}`。\n主要目录：{', '.join(dirs)}"
+
+        # 3. 项目进度/状态
+        if re.search(r"项目.{0,6}(进度|状态|进展|到哪了)", p, re.IGNORECASE):
+            progress = tool_dir / "docs" / "PROGRESS.md"
+            if progress.exists():
+                lines = progress.read_text(encoding="utf-8").splitlines()
+                # 提取"当前状态"段落
+                state_lines = []
+                in_state = False
+                for line in lines[:50]:
+                    if "当前状态" in line:
+                        in_state = True
+                    elif in_state and line.startswith("## "):
+                        break
+                    if in_state:
+                        state_lines.append(line)
+                if state_lines:
+                    return "\n".join(state_lines)
+            return "未找到进度文档。"
+
+        # 4. 项目结构
+        if re.search(r"项目.{0,4}(结构|源码|代码在哪)|目录.{0,4}(文件|功能|内容)|各.{0,3}目录", p, re.IGNORECASE):
+            return _project_structure(tool_dir)
+
+        # 5. 项目怎么训练
+        if re.search(r"项目.{0,6}(怎么训|训练|train)", p, re.IGNORECASE):
+            return (
+                f"训练流程：\n"
+                f"1. 预训练：src/train.py + src/prepare.py（数据准备）\n"
+                f"2. 继续预训练：src/continue_pretrain.py（追加工具 token）\n"
+                f"3. SFT：src/sft.py（混合数据微调）\n"
+                f"4. 评测：scripts/eval_bench.py + scripts/eval_tool_format.py\n"
+                f"5. 推理：src/infer.py（含工具 runtime）\n"
+                f"当前主线 checkpoint：sft_tool_summary_v4_best.pt"
+            )
+
+        # 不拦截其他"项目"相关但不明确的问题
+        return None
+
+    def _project_structure(tool_dir: Path) -> str:
+        parts = [f"项目 `{tool_dir.name}` 结构："]
+        for subdir, label in [("src", "核心模块"), ("scripts", "脚本"), ("docs", "文档"), ("tests", "测试")]:
+            d = tool_dir / subdir
+            if d.is_dir():
+                files = sorted(f.name for f in d.iterdir() if f.suffix in (".py", ".md"))
+                if files:
+                    parts.append(f"  {subdir}/ ({len(files)} 个{label}): {', '.join(files)}")
+        return "\n".join(parts)
 
     def generate(prompt: str) -> str:
         """生成回答，支持工具调用循环。"""
@@ -199,14 +279,20 @@ def main() -> None:
         if hard_rule_answer:
             return hard_rule_answer
 
+        project_answer = _project_answer(prompt)
+        if project_answer:
+            return project_answer
+
         prompt_ids = [bos_id, user_id] + system_ids + tokenizer.encode(prompt) + [asst_id]
         x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         generated_ids: list[int] = []
+        last_tool_result: str | None = None
 
         # 工具调用 token IDs
         tool_call_end_id = enc.encode_single_token('<|tool_call_end|>') if '<|tool_call_end|>' in {t for t in SPECIAL_TOKENS} else None
         tool_result_start_tag = '<|tool_result_start|>'
         tool_result_end_tag = '<|tool_result_end|>'
+        TOOL_CALL_START = '<|tool_call_start|>'
         max_tool_rounds = 3  # 最多执行 3 轮工具调用
 
         for _tool_round in range(max_tool_rounds + 1):
@@ -253,29 +339,32 @@ def main() -> None:
                 break
 
             # 检查是否触发了工具调用 (只解析当前轮次生成的内容)
+            decoded_new_tokens = tokenizer.decode(round_ids)
+            tool_parsed = None
+
             if tool_call_end_id and round_ids and round_ids[-1] == tool_call_end_id:
-                decoded_new_tokens = tokenizer.decode(round_ids)
+                tool_parsed = parse_tool_call(decoded_new_tokens)
+            elif TOOL_CALL_START in decoded_new_tokens:
+                # 容错：模型输出了 tool_call_start 但没有 tool_call_end
                 tool_parsed = parse_tool_call(decoded_new_tokens)
 
-                if tool_parsed:
-                    tool_name, params = tool_parsed
-                    print(f"  [工具调用] {tool_name}({json.dumps(params, ensure_ascii=False)})")
-                    result = execute_tool(tool_name, params, args.tool_dir)
-                    result_short = result[:500] + "..." if len(result) > 500 else result
-                    print(f"  [工具结果] {result_short[:200]}")
+            if tool_parsed:
+                tool_name, params = tool_parsed
+                print(f"  [工具调用] {tool_name}({json.dumps(params, ensure_ascii=False)})")
+                result = execute_tool(tool_name, params, args.tool_dir)
+                result_short = result[:500] + "..." if len(result) > 500 else result
+                print(f"  [工具结果] {result_short[:200]}")
 
-                    # 注入工具结果到上下文
-                    result_text = f"{tool_result_start_tag}{result}{tool_result_end_tag}"
-                    result_ids = enc.encode(result_text, allowed_special="all")
-                    generated_ids.extend(result_ids)
-                    result_tensor = torch.tensor([result_ids], dtype=torch.long, device=device)
-                    x = torch.cat([x, result_tensor], dim=1)
-                    continue  # 继续生成（模型会输出总结）
-                else:
-                    # 工具调用解析失败，直接结束
-                    break
+                # 注入工具结果到上下文（匹配训练格式：ASST_ID + result + ASST_ID）
+                result_text = f"{tool_result_start_tag}{result}{tool_result_end_tag}"
+                result_ids = [asst_id] + enc.encode(result_text, allowed_special="all") + [asst_id]
+                generated_ids.extend(result_ids)
+                result_tensor = torch.tensor([result_ids], dtype=torch.long, device=device)
+                x = torch.cat([x, result_tensor], dim=1)
+                last_tool_result = result
+                continue  # 继续生成（模型会输出总结）
             else:
-                # 正常结束（遇到 EOS 等）
+                # 没有工具调用，正常结束
                 generated_ids.extend(round_ids)
                 break
 
@@ -285,7 +374,18 @@ def main() -> None:
             idx = result.find(leak)
             if idx >= 0:
                 result = result[:idx].strip()
-        return result.strip()
+        # 清理 reserved token 泄露
+        for tag in ['<|reserved_0|>', '<|reserved_1|>', '<|reserved_2|>', '<|reserved_3|>']:
+            result = result.replace(tag, '')
+        result = result.strip()
+
+        # Fallback：如果工具执行成功但模型没有生成 summary，
+        # 用工具结果首条命中作为回答
+        if not result and last_tool_result:
+            first_line = last_tool_result.split('\n', 1)[0].strip()
+            result = f"根据搜索结果，我找到了相关位置，首条匹配是：`{first_line}`。"
+
+        return result
 
     if args.prompt is not None:
         print("--- Output ---")

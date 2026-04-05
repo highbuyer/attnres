@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""微研 API Server — OpenAI 兼容的 HTTP API。
+
+启动：
+    ./weiyan-api                    # 默认 localhost:8000
+    ./weiyan-api --port 8080        # 自定义端口
+    ./weiyan-api --host 0.0.0.0     # 允许外部访问
+
+调用（兼容 OpenAI 格式）：
+    curl http://localhost:8000/v1/chat/completions \\
+      -H "Content-Type: application/json" \\
+      -d '{"messages": [{"role": "user", "content": "当前项目是做什么的？"}]}'
+
+也支持简化格式：
+    curl http://localhost:8000/ask \\
+      -H "Content-Type: application/json" \\
+      -d '{"prompt": "parse_tool_call 在哪？"}'
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import uuid
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from threading import Lock
+
+# 加载推理引擎
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
+
+_model = None
+_generate_fn = None
+_lock = Lock()
+
+
+def _init_model(checkpoint: str, tool_dir: str):
+    """加载模型，返回 generate 函数。"""
+    global _model, _generate_fn
+
+    import os
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+    import torch
+    import types
+    import __main__
+    from contextlib import nullcontext
+
+    src_dir = ROOT / "src"
+    sys.path.insert(0, str(src_dir))
+
+    lines = (src_dir / "train.py").read_text(encoding="utf-8").splitlines(keepends=True)
+    cut = next(i for i, line in enumerate(lines) if "# Setup: tokenizer, model, optimizer, dataloader" in line)
+    src = "".join(lines[:cut])
+
+    fake = types.ModuleType("prepare")
+    fake.MAX_SEQ_LEN = 2048
+    fake.TIME_BUDGET = 999999
+    fake.Tokenizer = None
+    fake.make_dataloader = None
+    fake.evaluate_bpb = None
+    sys.modules["prepare"] = fake
+    try:
+        ns = {}
+        exec(compile(src, "train.py", "exec"), ns)
+    finally:
+        del sys.modules["prepare"]
+
+    GPT = ns["GPT"]
+    GPTConfig = ns["GPTConfig"]
+    __main__.GPT = GPT
+    __main__.GPTConfig = GPTConfig
+    GPT.__module__ = "__main__"
+    GPTConfig.__module__ = "__main__"
+
+    from prepare import SPECIAL_TOKENS, Tokenizer
+    from dataclasses import fields
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    raw_config = ckpt["config"]
+    if isinstance(raw_config, dict):
+        allowed = {f.name for f in fields(GPTConfig)}
+        config = GPTConfig(**{k: v for k, v in raw_config.items() if k in allowed})
+    else:
+        config = raw_config
+
+    use_bf16 = device == "cuda"
+    model_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    model = GPT(config).to(device=device, dtype=model_dtype)
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state"].items()}
+    model.load_state_dict(state, strict=False)
+    model.to(dtype=model_dtype)
+    model.eval()
+
+    head_dim = config.n_embd // config.n_head
+    cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
+    model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
+
+    metric_key = "val_bpt" if "val_bpt" in ckpt else "val_bpb"
+    print(f"Model loaded: {Path(checkpoint).name}, {metric_key}={ckpt[metric_key]:.4f}, device={device}")
+
+    # 构建 generate 函数（复用 infer.py 的逻辑）
+    import re
+    from inference_rules import apply_hard_rules
+    from tool_protocol import execute_tool, parse_tool_call, strip_tool_markup
+
+    tokenizer = Tokenizer.from_directory()
+    enc = tokenizer.enc
+    bos_id = tokenizer.get_bos_token_id()
+    user_id = enc.encode_single_token("<|reserved_1|>")
+    asst_id = enc.encode_single_token("<|reserved_2|>")
+    eos_id = enc.encode_single_token("<|reserved_3|>")
+    stop_ids = {enc.encode_single_token(t) for t in ["<|reserved_0|>", "<|reserved_1|>", "<|reserved_2|>", "<|reserved_3|>"]}
+    tool_call_end_id = enc.encode_single_token("<|tool_call_end|>")
+    TOOL_CALL_START = "<|tool_call_start|>"
+
+    system_prompt = "你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。"
+    if tool_dir:
+        project_name = Path(tool_dir).resolve().name
+        system_prompt += f"\n当前工作目录: {tool_dir}（项目: {project_name}）。你可以使用 search_code 和 read_file 工具查看项目代码。"
+    system_ids = tokenizer.encode(system_prompt + "\n")
+
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
+
+    # 项目问答（同 infer.py）
+    def _project_answer(prompt_text):
+        if not tool_dir:
+            return None
+        td = Path(tool_dir).resolve()
+        p = prompt_text.strip()
+        if re.search(r"用.{0,4}(python|代码|脚本)|写.{0,3}(代码|脚本|程序)|查询|搜索|读取|打开|给我看|show|read|find", p, re.IGNORECASE):
+            return None
+        if re.search(r"(项目|attnres).{0,6}(是什么|做什么|干什么|干嘛|目标|目的|用途|功能|简介|介绍)", p, re.IGNORECASE):
+            return f"`{td.name}` 是一个 400M 参数的工具调用调度器项目。\n目标：训练小模型学会在合适时机调用 search_code / read_file 工具检索代码，并用自然语言总结结果。"
+        if re.search(r"(当前|这个).{0,4}(项目|目录|路径)|项目.{0,4}(目录|路径)|你在哪|工作目录", p, re.IGNORECASE):
+            dirs = [e.name for e in sorted(td.iterdir()) if e.is_dir() and not e.name.startswith(".")]
+            return f"当前项目是 `{td.name}`，路径 `{td}`。\n主要目录：{', '.join(dirs)}"
+        if re.search(r"项目.{0,6}(进度|状态|进展)", p, re.IGNORECASE):
+            progress = td / "docs" / "PROGRESS.md"
+            if progress.exists():
+                lines = progress.read_text(encoding="utf-8").splitlines()
+                state_lines = []
+                in_state = False
+                for line in lines[:50]:
+                    if "当前状态" in line:
+                        in_state = True
+                    elif in_state and line.startswith("## "):
+                        break
+                    if in_state:
+                        state_lines.append(line)
+                if state_lines:
+                    return "\n".join(state_lines)
+        if re.search(r"项目.{0,4}(结构|源码)|目录.{0,4}(文件|功能)|各.{0,3}目录", p, re.IGNORECASE):
+            parts = [f"项目 `{td.name}` 结构："]
+            for subdir, label in [("src", "核心模块"), ("scripts", "脚本"), ("docs", "文档"), ("tests", "测试")]:
+                d = td / subdir
+                if d.is_dir():
+                    files = sorted(f.name for f in d.iterdir() if f.suffix in (".py", ".md"))
+                    if files:
+                        parts.append(f"  {subdir}/ ({len(files)} 个{label}): {', '.join(files)}")
+            return "\n".join(parts)
+        return None
+
+    def generate(prompt_text: str, max_tokens: int = 256, temperature: float = 0.0) -> str:
+        hard_rule = apply_hard_rules(prompt_text)
+        if hard_rule:
+            return hard_rule
+        proj = _project_answer(prompt_text)
+        if proj:
+            return proj
+
+        prompt_ids = [bos_id, user_id] + system_ids + tokenizer.encode(prompt_text) + [asst_id]
+        x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        generated_ids = []
+        last_tool_result = None
+
+        tool_result_start_tag = "<|tool_result_start|>"
+        tool_result_end_tag = "<|tool_result_end|>"
+
+        for _round in range(4):
+            round_ids = []
+            for _ in range(max_tokens):
+                with torch.no_grad(), autocast_ctx:
+                    logits = model(x[:, -config.sequence_len:])[:, -1, :]
+                if temperature <= 0:
+                    next_id = torch.argmax(logits, dim=-1, keepdim=True)
+                else:
+                    logits = logits / temperature
+                    probs = torch.softmax(logits, dim=-1)
+                    next_id = torch.multinomial(probs, num_samples=1)
+                token_id = int(next_id.item())
+
+                if tool_call_end_id and token_id == tool_call_end_id:
+                    round_ids.append(token_id)
+                    generated_ids.extend(round_ids)
+                    x = torch.cat([x, next_id], dim=1)
+                    break
+                if token_id in stop_ids:
+                    break
+                round_ids.append(token_id)
+                x = torch.cat([x, next_id], dim=1)
+            else:
+                generated_ids.extend(round_ids)
+                break
+
+            decoded = tokenizer.decode(round_ids)
+            tool_parsed = None
+            if round_ids and round_ids[-1] == tool_call_end_id:
+                tool_parsed = parse_tool_call(decoded)
+            elif TOOL_CALL_START in decoded:
+                tool_parsed = parse_tool_call(decoded)
+
+            if tool_parsed and tool_dir:
+                tool_name, params = tool_parsed
+                result = execute_tool(tool_name, params, tool_dir)
+                result_text = f"{tool_result_start_tag}{result}{tool_result_end_tag}"
+                result_ids = [asst_id] + enc.encode(result_text, allowed_special="all") + [asst_id]
+                generated_ids.extend(result_ids)
+                result_tensor = torch.tensor([result_ids], dtype=torch.long, device=device)
+                x = torch.cat([x, result_tensor], dim=1)
+                last_tool_result = result
+                continue
+            else:
+                generated_ids.extend(round_ids)
+                break
+
+        result = strip_tool_markup(tokenizer.decode(generated_ids))
+        for leak in ["\nHuman:", "\nAssistant:", "Human:", "Assistant:"]:
+            idx = result.find(leak)
+            if idx >= 0:
+                result = result[:idx].strip()
+        for tag in ["<|reserved_0|>", "<|reserved_1|>", "<|reserved_2|>", "<|reserved_3|>"]:
+            result = result.replace(tag, "")
+        result = result.strip()
+        if not result and last_tool_result:
+            first_line = last_tool_result.split("\n", 1)[0].strip()
+            result = f"根据搜索结果，我找到了相关位置，首条匹配是：`{first_line}`。"
+        return result
+
+    _generate_fn = generate
+    _model = model
+
+
+class WeiyanHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self._json_response({"status": "ok", "model": "weiyan-400m"})
+        elif self.path == "/v1/models":
+            self._json_response({"data": [{"id": "weiyan-400m", "object": "model"}]})
+        else:
+            self._json_response({"message": "微研 API. POST /v1/chat/completions 或 /ask"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+
+        if self.path == "/ask":
+            prompt = body.get("prompt", "")
+            max_tokens = body.get("max_tokens", 256)
+            temperature = body.get("temperature", 0.0)
+        elif self.path in ("/v1/chat/completions", "/chat/completions"):
+            messages = body.get("messages", [])
+            prompt = messages[-1]["content"] if messages else ""
+            max_tokens = body.get("max_tokens", 256)
+            temperature = body.get("temperature", 0.0)
+        elif self.path.startswith("/v1/messages"):
+            # Anthropic API 格式（Claude Code 用这个）
+            messages = body.get("messages", [])
+            prompt = ""
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+                if msg.get("role") == "user":
+                    prompt = content
+            max_tokens = body.get("max_tokens", 256)
+            temperature = body.get("temperature", 0.0)
+        else:
+            self.send_error(404)
+            return
+
+        with _lock:
+            answer = _generate_fn(prompt, max_tokens=max_tokens, temperature=temperature)
+
+        if self.path == "/ask":
+            self._json_response({"response": answer})
+        elif self.path.startswith("/v1/messages"):
+            # Anthropic 格式响应
+            self._json_response({
+                "id": f"msg_{uuid.uuid4().hex[:12]}",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": answer}],
+                "model": "weiyan-400m",
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            })
+        else:
+            self._json_response({
+                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "weiyan-400m",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": answer},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+    def _json_response(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+    def log_message(self, fmt, *args):
+        msg = fmt % args if args else fmt
+        sys.stderr.write(f"[weiyan] {str(msg)[:80]}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="微研 API Server")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--checkpoint", default=str(ROOT / "checkpoints" / "sft_tool_summary_v4_best.pt"))
+    parser.add_argument("--tool-dir", default=str(ROOT))
+    args = parser.parse_args()
+
+    print(f"Loading model: {args.checkpoint}")
+    _init_model(args.checkpoint, args.tool_dir)
+    print(f"微研 API ready at http://{args.host}:{args.port}")
+    print(f"  POST /v1/chat/completions  (OpenAI 兼容)")
+    print(f"  POST /ask                  (简化格式)")
+    print(f"  GET  /health               (健康检查)")
+
+    server = HTTPServer((args.host, args.port), WeiyanHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

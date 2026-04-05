@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=None, help="Warmup steps override")
     parser.add_argument("--warmdown-start", type=int, default=None, help="Warmdown start step override")
     parser.add_argument("--eval-interval", type=int, default=None, help="Validation interval override")
+    parser.add_argument("--batch-size", type=int, default=None, help="Device batch size override")
+    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps override")
     return parser.parse_args()
 
 
@@ -165,9 +167,13 @@ def save_best_artifacts(path, ckpt):
 
 def tokenize_turn(message):
     _ensure_tokenizer()
-    content_ids = enc.encode(message["content"], allowed_special="all")
+    content = message.get("content", "")
+    content_ids = enc.encode(content, allowed_special="all")
     if message["role"] in ("user", "tool"):
         return [USER_ID] + content_ids, [0] * (1 + len(content_ids))
+    # tool_result 由 runtime 注入，不是模型生成的，不计算 loss
+    if "<|tool_result_start|>" in content:
+        return [ASST_ID] + content_ids, [0] * (1 + len(content_ids))
     return [ASST_ID] + content_ids, [0] + [1] * len(content_ids)
 
 
@@ -269,6 +275,20 @@ def autocast_context(device):
     return nullcontext()
 
 
+def parameter_dtype_for_training(device):
+    import torch
+
+    # Keep trainable parameters in fp32 so small optimizer updates are not
+    # rounded away when the model is fine-tuned on narrow supervision.
+    return torch.float32
+
+
+def compute_dtype_for_training(device):
+    import torch
+
+    return torch.bfloat16 if device.type == "cuda" else torch.float32
+
+
 def evaluate_sft(model, val_data, device):
     import torch
     import torch.nn.functional as F
@@ -321,6 +341,8 @@ def main() -> None:
     warmup_steps = args.warmup_steps or 100
     warmdown_start = args.warmdown_start if args.warmdown_start is not None else int(total_steps * 0.8)
     eval_interval = args.eval_interval or 500
+    device_batch_size = args.batch_size or DEVICE_BATCH_SIZE
+    grad_accum = args.grad_accum or GRAD_ACCUM
 
     _ensure_model_defs()
     _ensure_tokenizer()
@@ -335,24 +357,25 @@ def main() -> None:
         torch.cuda.manual_seed_all(SEED)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    parameter_dtype = parameter_dtype_for_training(device)
+    compute_dtype = compute_dtype_for_training(device)
 
     print(f"Loading {checkpoint_in} on {device}...")
     ckpt = load_checkpoint(checkpoint_in, device)
     config = ckpt["config"]
 
-    model = GPT(config).to(device=device, dtype=model_dtype)
+    model = GPT(config).to(device=device, dtype=parameter_dtype)
     state = {key.replace("_orig_mod.", ""): value for key, value in ckpt["model_state"].items()}
     load_result = model.load_state_dict(state, strict=False)
     if load_result.missing_keys:
         print(f"WARNING: missing keys: {load_result.missing_keys}")
     if load_result.unexpected_keys:
         print(f"WARNING: unexpected keys: {load_result.unexpected_keys}")
-    model.to(dtype=model_dtype)
+    model.to(dtype=parameter_dtype)
 
     head_dim = config.n_embd // config.n_head
     cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
-    model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
+    model.cos, model.sin = cos.to(compute_dtype), sin.to(compute_dtype)
 
     metric_key = "val_bpt" if "val_bpt" in ckpt else "val_bpb"
     print(f"Checkpoint {checkpoint_in}: {metric_key}={ckpt[metric_key]:.4f}, step={ckpt['step']}")
@@ -373,7 +396,7 @@ def main() -> None:
     print(f"  Data:   {data_path}")
     print(f"  LR:     {lr}")
     print(f"  Steps:  total={total_steps} warmup={warmup_steps} warmdown={warmdown_start} eval={eval_interval}")
-    print(f"Starting SFT: {total_steps} steps, lr={lr}, batch={DEVICE_BATCH_SIZE * GRAD_ACCUM}")
+    print(f"Starting SFT: {total_steps} steps, lr={lr}, batch={device_batch_size * grad_accum}")
     print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}")
 
     train_idx = list(range(len(train_data)))
@@ -383,7 +406,7 @@ def main() -> None:
     def next_batch():
         nonlocal train_idx, idx_ptr
         batch_indices = []
-        while len(batch_indices) < DEVICE_BATCH_SIZE:
+        while len(batch_indices) < device_batch_size:
             if idx_ptr >= len(train_idx):
                 random.shuffle(train_idx)
                 idx_ptr = 0
@@ -407,7 +430,7 @@ def main() -> None:
         accum_loss = 0.0
         accum_tokens = 0
 
-        for _ in range(GRAD_ACCUM):
+        for _ in range(grad_accum):
             batch = next_batch()
             x, y, loss_mask = make_batch(batch, device)
             with autocast_context(device):
@@ -415,7 +438,7 @@ def main() -> None:
             logits = logits.float()
             loss_per_tok = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), reduction="none")
             masked_loss = (loss_per_tok * loss_mask.view(-1)).sum() / (loss_mask.sum() + 1e-8)
-            (masked_loss / GRAD_ACCUM).backward()
+            (masked_loss / grad_accum).backward()
             accum_loss += masked_loss.item()
             accum_tokens += int(loss_mask.sum().item())
 
@@ -426,7 +449,7 @@ def main() -> None:
         dt = time.time() - t0
         t0 = time.time()
         print(
-            f"step {step:04d}/{total_steps} | loss={accum_loss / GRAD_ACCUM:.4f} | "
+            f"step {step:04d}/{total_steps} | loss={accum_loss / grad_accum:.4f} | "
             f"lr={current_lr:.2e} | tok={accum_tokens} | dt={dt * 1000:.0f}ms"
         )
 

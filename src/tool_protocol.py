@@ -74,6 +74,12 @@ def parse_tool_call(text: str) -> tuple[str, dict] | None:
 
         tc_end = text.find(TOOL_CALL_END, tc_start + len(TOOL_CALL_START))
         if tc_end == -1:
+            # 容错：模型输出了 tool_call_start 但没有 tool_call_end，
+            # 取到文本末尾尝试解析
+            inner = text[tc_start + len(TOOL_CALL_START):]
+            parsed = _parse_tool_call_inner(inner)
+            if parsed is not None:
+                parsed_call = parsed
             break
 
         inner = text[tc_start + len(TOOL_CALL_START):tc_end]
@@ -163,6 +169,9 @@ def execute_tool(tool_name: str, params: dict, work_dir: str | Path) -> str:
 
         if tool_name == "read_file":
             rel_path = params.get("path", "")
+            # 容错：模型传了 search_code 的参数给 read_file，降级为 search_code
+            if not rel_path and "query" in params:
+                return "\n".join(_search_code_results(params["query"], work_dir)) or f"(未找到匹配: {params['query']})"
             offset = int(params.get("offset", 1))
             limit = int(params.get("limit", 20))
             root_path = Path(work_dir).resolve()
@@ -171,6 +180,9 @@ def execute_tool(tool_name: str, params: dict, work_dir: str | Path) -> str:
                 return f"(路径越界: {rel_path})"
             if not full_path.exists():
                 return f"(文件不存在: {rel_path})"
+            if full_path.is_dir():
+                entries = sorted(full_path.iterdir())[:30]
+                return "\n".join(e.name + ("/" if e.is_dir() else "") for e in entries)
             lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
             selected = lines[max(0, offset - 1):offset - 1 + limit]
             return "\n".join(f"{offset + i} {line}" for i, line in enumerate(selected))

@@ -85,6 +85,13 @@ BENCH = [
     {"id": "mt_08", "category": "上下文", "prompt": "Python 和 Java 哪个更适合初学者？"},
     {"id": "mt_09", "category": "上下文", "prompt": "什么是过拟合？如何解决？"},
     {"id": "mt_10", "category": "上下文", "prompt": "请给我讲一个笑话"},
+
+    # --- 工具调用（应该触发工具的 prompt） ---
+    {"id": "tl_01", "category": "工具调用", "prompt": "当前仓库里 parse_tool_call 是在哪里实现的？"},
+    {"id": "tl_02", "category": "工具调用", "prompt": "给我看 src/infer.py 参数定义那一段。"},
+    {"id": "tl_03", "category": "工具调用", "prompt": "项目里怎么做代码搜索的？"},
+    {"id": "tl_04", "category": "工具调用", "prompt": "tokenizer 怎么初始化的？"},
+    {"id": "tl_05", "category": "工具调用", "prompt": "show me the forward method"},
 ]
 
 # ---------------------------------------------------------------------------

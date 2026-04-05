@@ -6,6 +6,26 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 
 This fork no longer follows the original flat three-file layout exactly. The current repository is organized around explicit `src/`, `tests/`, `scripts/`, and `docs/` directories, while still keeping the original autoresearch workflow notes in `docs/program.md`. A bit more context on the original project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
 
+## Current Status
+
+Current main checkpoints:
+
+- `checkpoints/sft_mixed_v8_checkpoint_v2_best.pt` — current main best, `step=13000`, `val_bpt=3.7860`
+- `checkpoints/sft_toolheavy_v1_best.pt` — tool-heavy experiment, `step=100`, `val_bpt=3.8836`
+
+What works now:
+
+- Identity and safety hard rules in `src/infer.py`
+- Repo-aware path handling in `src/project_paths.py`
+- Tool runtime for `search_code` and `read_file`
+- Unit test coverage for rules, tool protocol, path helpers, and attention-window fallback
+
+Current blocker:
+
+- The model still does not proactively emit `<|tool_call_start|>...`
+- `eval_tool_format` remains `0/8` on both the main best and the tool-heavy checkpoint
+- The next useful experiment is a `tool-policy-only` short SFT phase, not another broad mixed SFT run
+
 ## How it works
 
 The core code now lives under `src/`, with helper scripts in `scripts/` and notes in `docs/`. The main entry points are:
@@ -57,7 +77,11 @@ Additional common commands:
 uv run python src/continue_pretrain.py checkpoints/tooltoken_d18_32k.pt
 
 # Run SFT; override dataset path explicitly when needed
-uv run python src/sft.py checkpoints/tooltoken_d18_32k.pt --data /path/to/data.jsonl
+uv run python src/sft.py checkpoints/sft_mixed_v8_checkpoint_v2_best.pt --data /path/to/data.jsonl
+
+# Evaluate current main best
+uv run python scripts/eval_bench.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt
+uv run python scripts/eval_tool_format.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt --out eval_tool_format_main.json
 ```
 
 ## Running the agent

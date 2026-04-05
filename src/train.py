@@ -154,13 +154,15 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim).to(v.dtype)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels])).to(v.dtype)
             v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
 
         if hasattr(fa3, 'flash_attn_func') and fa3.flash_attn_func is not None and q.is_cuda:
             y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)

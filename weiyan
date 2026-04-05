@@ -1,0 +1,27 @@
+#!/bin/bash
+# 微研 CLI — 使用当前主线 checkpoint 的交互式助手
+# 用法: ./weiyan [prompt]
+#   无参数: 进入交互模式
+#   有参数: 单次问答
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CHECKPOINT="$SCRIPT_DIR/checkpoints/sft_tool_summary_v4_best.pt"
+TOOL_DIR="$SCRIPT_DIR"
+
+if [ ! -f "$CHECKPOINT" ]; then
+    echo "Checkpoint not found: $CHECKPOINT"
+    exit 1
+fi
+
+if [ $# -eq 0 ]; then
+    # 交互模式
+    env UV_CACHE_DIR=/tmp/uv-cache /home/langshen/.local/bin/uv run python "$SCRIPT_DIR/src/infer.py" \
+        --checkpoint "$CHECKPOINT" \
+        --tool-dir "$TOOL_DIR"
+else
+    # 单次问答
+    env UV_CACHE_DIR=/tmp/uv-cache /home/langshen/.local/bin/uv run python "$SCRIPT_DIR/src/infer.py" \
+        "$*" 512 0.2 \
+        --checkpoint "$CHECKPOINT" \
+        --tool-dir "$TOOL_DIR"
+fi

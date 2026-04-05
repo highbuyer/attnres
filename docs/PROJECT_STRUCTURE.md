@@ -2,57 +2,80 @@
 
 ```
 attnres/
-├── src/                 # 主代码
-│   ├── train.py         # 预训练（模型定义 + 训练循环）
-│   ├── prepare.py       # 数据准备 + tokenizer + dataloader + 评估
-│   ├── sft.py           # SFT 微调
-│   ├── infer.py         # 推理
-│   └── continue_pretrain.py  # 继续预训练
-├── scripts/             # 辅助脚本
-│   ├── eval_bench.py    # 评估基准（51 条固定测试集）
-│   ├── expand_checkpoint.py  # 模型规模扩展（深度/宽度）
-│   ├── migrate_embeddings.py # 词表迁移（8K→32K）
-│   ├── add_tool_tokens.py    # 追加工具调用 special tokens
-│   ├── make_sft_data.py # SFT 数据构建
-│   └── generate.py      # 简单文本生成
-├── docs/                # 文档
-│   ├── PROGRESS.md      # 项目进度与计划（最重要）
-│   ├── PROJECT_STRUCTURE.md  # 本文件
-│   ├── program.md       # 原始 autoresearch 实验协议
-│   └── tool_call_samples_v2.jsonl  # 工具调用训练样本
-├── logs/                # 训练日志
-├── checkpoints/         # 模型文件
-│   ├── continued_d18_32k_final.pt  # 预训练主线（val_bpb=0.572887）
-│   ├── tooltoken_d18_32k.pt       # 追加工具 token 后的 checkpoint
-│   └── sft_d18_v3_checkpoint.pt   # SFT 模型（旧，将被替代）
-└── data -> ~/.cache/autoresearch-custom/data  # 数据目录 (symlink)
+├── src/
+│   ├── train.py              # 主预训练脚本 + 模型定义
+│   ├── continue_pretrain.py  # 继续预训练
+│   ├── prepare.py            # 数据准备 / tokenizer / dataloader / val_bpb
+│   ├── infer.py              # 推理入口 + 硬规则 + 工具 runtime
+│   ├── infer_support.py      # 推理后端检查
+│   ├── inference_rules.py    # 身份 / 安全硬规则
+│   ├── tool_protocol.py      # tool_call 解析与执行
+│   ├── project_paths.py      # repo-aware checkpoint / data 路径解析
+│   ├── sft.py                # SFT 训练入口
+│   ├── sft_format.py         # SFT 样本切分逻辑
+│   └── attention_window.py   # SDPA 滑动窗口掩码
+├── scripts/
+│   ├── eval_bench.py         # 51 条固定评测集
+│   ├── eval_tool_format.py   # 工具格式评测
+│   ├── inspect_tool_start_logits.py  # `<|tool_call_start|>` 首 token 排名检查
+│   ├── make_sft_data.py      # 混合 SFT 数据构建
+│   ├── build_tool_call_data.py  # 基于当前仓库生成 repo 工具样本
+│   ├── audit_tool_data.py    # 工具样本验真
+│   ├── audit_sft_tool_mix.py # SFT 数据中工具分布审计
+│   ├── add_tool_tokens.py    # tokenizer 追加工具 token
+│   ├── expand_checkpoint.py  # 模型扩展
+│   └── migrate_embeddings.py # 词表迁移
+├── tests/
+│   ├── test_tool_protocol.py
+│   ├── test_sft_format.py
+│   ├── test_sft_resume.py
+│   ├── test_project_paths.py
+│   ├── test_inference_rules.py
+│   ├── test_infer_support.py
+│   └── test_attention_window.py
+├── docs/
+│   ├── PROGRESS.md
+│   ├── README.md
+│   ├── SFT_README.md
+│   ├── INFER_README.md
+│   ├── CONTINUE_PRETRAIN_README.md
+│   ├── PREPARE_README.md
+│   ├── RUN_NEXT.md
+│   ├── PROJECT_STRUCTURE.md
+│   ├── program.md
+│   └── tool_call_samples_repo.jsonl
+├── checkpoints/
+│   ├── sft_mixed_v8_checkpoint_v2_best.pt
+│   ├── sft_toolheavy_v1_best.pt
+│   ├── tooltoken_continued_final.pt
+│   └── continued_d18_32k_final.pt
+└── data -> ~/.cache/autoresearch-custom/data
 ```
 
-## 目录重组说明（2026-03-30）
+## 路径和加载原则
 
-项目原来是平铺结构（所有 .py 在根目录），后来重组为 `src/` + `scripts/` + `docs/`。
+### 1. 所有命令默认从仓库根目录执行
 
-### 路径解析机制
+统一用法：
 
-所有脚本使用 `__file__` 相对路径定位依赖，**不依赖 CWD**：
+```bash
+uv run python src/infer.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt
+uv run python src/sft.py checkpoints/sft_mixed_v8_checkpoint_v2_best.pt --data sft_toolheavy_v1.jsonl
+uv run python scripts/eval_bench.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt
+```
 
-- **src/ 文件**通过 `Path(__file__).resolve().parent / "train.py"` 找同目录下的 train.py
-- **scripts/ 文件**通过 `Path(__file__).resolve().parent.parent / "src" / "train.py"` 回溯到 src/
-- 所有需要 `from prepare import ...` 的文件会先 `sys.path.insert(0, str(_SRC_DIR))` 确保 import 可达
+### 2. 不依赖 CWD 的路径解析
 
-### 为什么这样设计
+- `src/` 文件内部通过 `__file__` 找 `train.py`
+- `scripts/` 文件回溯到仓库根，再定位 `src/`
+- checkpoint 和 SFT 数据默认路径通过 `project_paths.py` 统一解析
 
-多个脚本需要动态加载 `train.py` 中的模型定义（`GPT`, `GPTConfig`），通过 `exec()` 执行 train.py 的前半部分代码。这要求能找到 train.py 文件路径，同时 train.py 自身 `from prepare import ...` 也要能解析。用 `__file__` 相对路径解决了这两个问题。
+### 3. 当前主线 best / 实验 best
 
-### 如果遇到 import 报错
+- 主线 best：`checkpoints/sft_mixed_v8_checkpoint_v2_best.pt`
+- tool-heavy 实验 best：`checkpoints/sft_toolheavy_v1_best.pt`
 
-1. **`ModuleNotFoundError: No module named 'prepare'`** → 检查是否缺少 `sys.path.insert(0, str(_SRC_DIR))`
-2. **`FileNotFoundError: train.py`** → 检查 Path 是否用了 `__file__` 相对路径而非裸 `Path("train.py")`
-3. **`Can't get attribute 'GPTConfig'`** → 加载 checkpoint 前需要先调 `_load_model_defs()` 注册类
-
-## 快速命令
-
-所有命令从**项目根目录**运行：
+## 常用命令
 
 ```bash
 # 预训练
@@ -61,21 +84,16 @@ uv run python src/train.py
 # 继续预训练
 uv run python src/continue_pretrain.py checkpoints/tooltoken_d18_32k.pt
 
-# SFT
-uv run python src/sft.py checkpoints/tooltoken_d18_32k.pt
-
 # 推理
-uv run python src/infer.py checkpoints/sft_d18_v3_checkpoint.pt
+uv run python src/infer.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt
 
-# 评估
-uv run python scripts/eval_bench.py --checkpoint checkpoints/sft_d18_v3_checkpoint.pt
+# 主线评测
+uv run python scripts/eval_bench.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt
+uv run python scripts/eval_tool_format.py --checkpoint checkpoints/sft_mixed_v8_checkpoint_v2_best.pt --out eval_tool_format_main.json
 
-# 追加工具 token + 扩展 embedding
-uv run python scripts/add_tool_tokens.py --checkpoint checkpoints/xxx.pt --output checkpoints/yyy.pt
+# 构建 repo 工具样本
+uv run python scripts/build_tool_call_data.py --out docs/tool_call_samples_repo.jsonl
 
-# 构建 SFT 数据
-uv run python scripts/make_sft_data.py
-
-# 模型规模扩展
-uv run python scripts/expand_checkpoint.py checkpoints/src.pt checkpoints/dst.pt --depth 18
+# 构建 tool-heavy 数据
+uv run python scripts/make_sft_data.py --out sft_toolheavy_v1.jsonl --max-belle 0 --max-multiturn 0 --max-school-math 0 --max-claude 6000 --upsample 50 --negative-identity-upsample 80 --tool-call-upsample 1200
 ```
