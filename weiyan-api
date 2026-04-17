@@ -192,7 +192,7 @@ def _wiki_lookup(query: str) -> tuple[str | None, str]:
         )
         try:
             req = urllib.request.Request(search_url, headers={"User-Agent": _WIKI_UA})
-            with urllib.request.urlopen(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
+            with _URL_OPENER.open(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_reason = f"检索 HTTP {exc.code}（候选「{cand}」）"
@@ -210,7 +210,7 @@ def _wiki_lookup(query: str) -> tuple[str | None, str]:
         summary_url = "https://zh.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(real_title)
         try:
             req = urllib.request.Request(summary_url, headers={"User-Agent": _WIKI_UA})
-            with urllib.request.urlopen(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
+            with _URL_OPENER.open(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
                 summary = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_reason = f"词条页 HTTP {exc.code}（「{real_title}」）"
@@ -232,9 +232,28 @@ def _wiki_lookup(query: str) -> tuple[str | None, str]:
 
 
 _PROJECT_SCOPE_KEYWORDS = re.compile(
-    r"(项目|仓库|代码|文件|函数|类|脚本|模块|目录|路径|配置|checkpoint|weiyan|微研|attnres|sft|infer|train|eval|tokenizer|分词|架构|流程)",
+    r"(项目|仓库|代码|文件|函数|类|脚本|模块|目录|路径|配置|checkpoint|weiyan|微研|attnres|sft|infer|train|eval|tokenizer|分词|架构|流程|内容|里有什么|写了什么|里面是什么|\.(?:py|md|json|jsonl|toml|yaml|yml|txt|sh|cfg))",
     re.IGNORECASE,
 )
+_FILE_REF_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:py|md|json|jsonl|toml|yaml|yml|txt|sh|cfg))", re.IGNORECASE)
+
+
+def _build_url_opener():
+    """显式构造支持代理的 opener。urllib 默认也读 env，但对 HTTPS + 大写变量有时失灵，这里兜底。"""
+    import os
+    proxies = {}
+    for scheme in ("http", "https"):
+        for var in (scheme + "_proxy", (scheme + "_proxy").upper()):
+            if os.environ.get(var):
+                proxies[scheme] = os.environ[var]
+                break
+    handlers = []
+    if proxies:
+        handlers.append(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(*handlers)
+
+
+_URL_OPENER = _build_url_opener()
 
 
 def _research_fallback(prompt_text: str, tool_dir: str | None, req_id: str) -> str:
@@ -593,6 +612,20 @@ def _init_model(checkpoint: str, tool_dir: str):
             if root_list and not root_list.startswith("("):
                 return f"项目根目录 `{Path(tool_dir).resolve().name}` 下主要条目：\n" + root_list
             return None
+
+        # 文件内容直读短路：匹配到形如 FOO.md / foo.py 的引用，且问句带 "内容/有什么/看一下/读" 意图
+        file_ref_match = _FILE_REF_RE.search(p)
+        if file_ref_match and any(k in normalized for k in ("内容", "有什么", "看一下", "看下", "读一下", "读下", "读", "讲了什么", "写了什么")):
+            rel = file_ref_match.group(1)
+            _debug("repo-shortcut", f"repo shortcut hit: file_read rel={rel}")
+            content = execute_tool("read_file", {"path": rel, "offset": 1, "limit": 40}, tool_dir)
+            if content and not content.startswith("(文件不存在") and not content.startswith("(路径越界"):
+                return f"`{rel}` 前 40 行：\n" + content
+            # 项目根没有，再试 docs/ 前缀
+            content2 = execute_tool("read_file", {"path": f"docs/{rel}", "offset": 1, "limit": 40}, tool_dir)
+            if content2 and not content2.startswith("(文件不存在") and not content2.startswith("(路径越界"):
+                return f"`docs/{rel}` 前 40 行：\n" + content2
+            return f"`{rel}` 在项目里找不到。可能是路径不对或者这个文件不在当前仓库。"
 
         return None
 
