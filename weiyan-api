@@ -618,13 +618,30 @@ def _init_model(checkpoint: str, tool_dir: str):
         if file_ref_match and any(k in normalized for k in ("内容", "有什么", "看一下", "看下", "读一下", "读下", "读", "讲了什么", "写了什么")):
             rel = file_ref_match.group(1)
             _debug("repo-shortcut", f"repo shortcut hit: file_read rel={rel}")
-            content = execute_tool("read_file", {"path": rel, "offset": 1, "limit": 40}, tool_dir)
-            if content and not content.startswith("(文件不存在") and not content.startswith("(路径越界"):
-                return f"`{rel}` 前 40 行：\n" + content
-            # 项目根没有，再试 docs/ 前缀
-            content2 = execute_tool("read_file", {"path": f"docs/{rel}", "offset": 1, "limit": 40}, tool_dir)
-            if content2 and not content2.startswith("(文件不存在") and not content2.startswith("(路径越界"):
-                return f"`docs/{rel}` 前 40 行：\n" + content2
+            for try_path in (rel, f"docs/{rel}", f"src/{rel}", f"scripts/{rel}", f"tests/{rel}"):
+                content = execute_tool("read_file", {"path": try_path, "offset": 1, "limit": 40}, tool_dir)
+                if content and not content.startswith("(文件不存在") and not content.startswith("(路径越界"):
+                    return f"`{try_path}` 前 40 行：\n" + content
+            # 还是没找到：用 fd/find 按文件名全项目搜索
+            try:
+                located = subprocess.run(
+                    ["rg", "--files", "-g", rel],
+                    cwd=tool_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                hits = [line.strip() for line in located.stdout.splitlines() if line.strip()]
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                hits = []
+            if hits:
+                chosen = hits[0]
+                content = execute_tool("read_file", {"path": chosen, "offset": 1, "limit": 40}, tool_dir)
+                if content and not content.startswith("("):
+                    extra = ""
+                    if len(hits) > 1:
+                        extra = f"\n\n（仓库里还有其它同名文件：{', '.join(hits[1:4])}）"
+                    return f"`{chosen}` 前 40 行：\n{content}{extra}"
             return f"`{rel}` 在项目里找不到。可能是路径不对或者这个文件不在当前仓库。"
 
         return None
