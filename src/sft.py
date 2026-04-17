@@ -26,7 +26,17 @@ GRAD_ACCUM = 8
 FINAL_LR_FRAC = 0.1
 VAL_RATIO = 0.05
 SEED = 42
-SYSTEM_PROMPT = "你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。"
+SYSTEM_PROMPT = (
+    "你是微研，一个技术助手。用与用户相同的语言简洁回答。"
+    "不确定时如实说明，不编造事实。拒绝有害内容。"
+    "对于通用知识、Python/算法/CS 概念、代码模板等不依赖当前代码库的问题，直接回答，不要调用工具。"
+    "只有当问题需要当前项目中的事实、实现、文件内容、符号位置或路径信息时，才使用工具。"
+    "只允许使用这两个工具名：search_code、read_file。不要提及、假装调用或编造任何其他工具名。"
+    "遇到需要定位实现、报错、符号、字符串或文件内容时，优先用 search_code 缩小范围，再用 read_file 验证。"
+    "不要假装看过文件；没查到就明确说没查到。不要把代码搜索说成网页搜索。"
+    "不要凭空生成 localhost、浏览器操作步骤或 URL，除非用户明确提供，或工具结果中确实出现。"
+    "只有用户明确问当前工作目录、项目名或项目路径时，才回答目录信息。"
+)
 
 GPT = None
 GPTConfig = None
@@ -165,6 +175,10 @@ def save_best_artifacts(path, ckpt):
     best_metadata_path(path).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+DROPPED_SAMPLE_COUNT = 0
+TRUNCATED_SAMPLE_COUNT = 0
+
+
 def tokenize_turn(message):
     _ensure_tokenizer()
     content = message.get("content", "")
@@ -222,10 +236,22 @@ def format_samples_split(messages):
         mask.append(1)
 
         if len(ids) > MAX_SEQ_LEN:
-            excess = len(ids) - MAX_SEQ_LEN
-            cut = 1 + excess
-            while cut < len(ids) - 1 and ids[cut] not in (USER_ID, ASST_ID):
-                cut += 1
+            # 从左侧裁掉较早轮次，保留末尾含当前 assistant 的对话
+            # ids 结构：[BOS] + turn_ids[i0] + turn_ids[i1] + ... + [EOS]
+            # 找最靠右的 USER/ASST 边界，使得从该边界起到 EOS 的长度 <= MAX_SEQ_LEN - 1（BOS 占 1）
+            budget = MAX_SEQ_LEN - 1
+            # 从尾部往前找可行的裁切点
+            cut = None
+            for pos in range(len(ids) - 1, 0, -1):  # 不包括 BOS (pos 0)
+                if ids[pos] in (USER_ID, ASST_ID) and (len(ids) - pos) <= budget:
+                    cut = pos
+            if cut is None:
+                # 连最后一个 turn 都放不下，整条丢弃
+                global DROPPED_SAMPLE_COUNT
+                DROPPED_SAMPLE_COUNT += 1
+                continue
+            global TRUNCATED_SAMPLE_COUNT
+            TRUNCATED_SAMPLE_COUNT += 1
             ids = [BOS_ID] + ids[cut:]
             mask = [0] + mask[cut:]
 
@@ -236,6 +262,10 @@ def format_samples_split(messages):
 
 
 def build_datasets(data_path: str):
+    global DROPPED_SAMPLE_COUNT, TRUNCATED_SAMPLE_COUNT
+    DROPPED_SAMPLE_COUNT = 0
+    TRUNCATED_SAMPLE_COUNT = 0
+
     with open(data_path, encoding="utf-8") as handle:
         raw = [json.loads(line) for line in handle]
 
@@ -248,6 +278,8 @@ def build_datasets(data_path: str):
 
     train_data = [sample for record in train_raw for sample in format_samples_split(record["messages"])]
     val_data = [sample for record in val_raw for sample in format_samples_split(record["messages"])]
+    if TRUNCATED_SAMPLE_COUNT or DROPPED_SAMPLE_COUNT:
+        print(f"WARNING: truncated {TRUNCATED_SAMPLE_COUNT} samples, dropped {DROPPED_SAMPLE_COUNT} oversized samples")
     return raw, train_data, val_data
 
 
@@ -293,6 +325,9 @@ def evaluate_sft(model, val_data, device):
     import torch
     import torch.nn.functional as F
 
+    if not val_data:
+        return float("inf")
+
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -308,7 +343,9 @@ def evaluate_sft(model, val_data, device):
             total_loss += loss.item()
             total_tokens += loss_mask.sum().item()
     model.train()
-    return total_loss / max(total_tokens, 1) / math.log(2)
+    if total_tokens == 0:
+        return float("inf")
+    return total_loss / total_tokens / math.log(2)
 
 
 def resolve_resume_state(ckpt: dict, resume: bool) -> tuple[int, float]:

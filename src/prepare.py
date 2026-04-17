@@ -682,7 +682,8 @@ def train_tokenizer():
     test = "Hello world! Numbers: 123. Unicode: 你好"
     encoded = enc.encode_ordinary(test)
     decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
+    if decoded != test:
+        raise ValueError(f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}")
     print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 # ---------------------------------------------------------------------------
