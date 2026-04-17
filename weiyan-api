@@ -95,12 +95,37 @@ def _search_local_docs(query: str, tool_dir: str | None) -> str | None:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    # 过滤纯命令行/代码片段/训练数据：以 `uv run`、`python `、`$`、`#`、缩进代码、JSON 开头等
+    def _is_prose(line: str) -> bool:
+        # rg 输出格式: path:lineno:content
+        path_part, _, rest = line.partition(":")
+        _, _, content = rest.partition(":")
+        content = content.strip()
+        if not content:
+            return False
+        # 直接排除训练数据文件（jsonl/json 样本）
+        if path_part.endswith(".jsonl") or path_part.endswith(".json"):
+            return False
+        bad_prefixes = ("uv run", "python ", "python3 ", "bash ", "$ ", "# ", "```", ">>>", "import ", "from ", "{\"", "{'")
+        if any(content.startswith(p) for p in bad_prefixes):
+            return False
+        # 含工具协议 token 或明显 JSON 片段 → 训练数据
+        if "<|tool_" in content or '"messages":' in content or '"role":' in content:
+            return False
+        # 必须包含至少 4 个中文字符或 15 个字母字符，否则判为代码/表达式
+        chinese = sum(1 for ch in content if "\u4e00" <= ch <= "\u9fff")
+        if chinese < 4 and sum(1 for ch in content if ch.isalpha()) < 15:
+            return False
+        return True
+
+    lines = [line for line in lines if _is_prose(line)]
     if not lines:
         return None
     return "\n".join(lines[:3])
 
 
 _RESEARCH_STOPWORDS = set("的是什么吗呢何为怎么怎样如何请问给我查一下能够可以会不")
+_WIKI_UA = "Mozilla/5.0 (compatible; weiyan-api/1.0; +https://zh.wikipedia.org/)"
 
 
 def _candidate_titles(query: str) -> list[str]:
@@ -128,7 +153,7 @@ def _candidate_titles(query: str) -> list[str]:
 
 
 def _is_related(query: str, text: str) -> bool:
-    """query 与 text 是否共享至少一个 2-gram（中文）或 3-gram（英文），用来排除过度泛化的词条。"""
+    """query 与 text 是否共享至少一个 2-gram（中文）或 3-gram（英文），用来排除过度泛化的词条。单字 query 只要 text 里出现过就算相关。"""
     if not query or not text:
         return False
     q_norm = "".join(ch for ch in query if ch not in _RESEARCH_STOPWORDS)
@@ -136,6 +161,9 @@ def _is_related(query: str, text: str) -> bool:
     text_norm = re.sub(r"\s+", "", text[:500])
     if not q_norm:
         return False
+    # 单字 query：只要 text 开头 100 字包含该字即算相关
+    if len(q_norm) == 1:
+        return q_norm in text_norm[:100]
     grams = set()
     for i in range(len(q_norm) - 1):
         grams.add(q_norm[i:i + 2])
@@ -163,11 +191,14 @@ def _wiki_lookup(query: str) -> tuple[str | None, str]:
             + urllib.parse.quote(cand)
         )
         try:
-            req = urllib.request.Request(search_url, headers={"User-Agent": "weiyan-api/1.0"})
+            req = urllib.request.Request(search_url, headers={"User-Agent": _WIKI_UA})
             with urllib.request.urlopen(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_reason = f"检索 HTTP {exc.code}（候选「{cand}」）"
+            continue
         except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            return None, f"联网不可达 ({exc.__class__.__name__})"
+            return None, f"联网不可达 ({exc.__class__.__name__}: {exc})"
         except Exception as exc:
             last_reason = f"维基检索异常 ({exc.__class__.__name__})"
             continue
@@ -178,11 +209,14 @@ def _wiki_lookup(query: str) -> tuple[str | None, str]:
         real_title = matched_titles[0]
         summary_url = "https://zh.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(real_title)
         try:
-            req = urllib.request.Request(summary_url, headers={"User-Agent": "weiyan-api/1.0"})
+            req = urllib.request.Request(summary_url, headers={"User-Agent": _WIKI_UA})
             with urllib.request.urlopen(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
                 summary = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_reason = f"词条页 HTTP {exc.code}（「{real_title}」）"
+            continue
         except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            return None, f"词条页请求失败 ({exc.__class__.__name__})"
+            return None, f"词条页请求失败 ({exc.__class__.__name__}: {exc})"
         except Exception as exc:
             last_reason = f"词条页解析失败 ({exc.__class__.__name__})"
             continue
@@ -197,20 +231,30 @@ def _wiki_lookup(query: str) -> tuple[str | None, str]:
     return None, last_reason
 
 
+_PROJECT_SCOPE_KEYWORDS = re.compile(
+    r"(项目|仓库|代码|文件|函数|类|脚本|模块|目录|路径|配置|checkpoint|weiyan|微研|attnres|sft|infer|train|eval|tokenizer|分词|架构|流程)",
+    re.IGNORECASE,
+)
+
+
 def _research_fallback(prompt_text: str, tool_dir: str | None, req_id: str) -> str:
-    """模型拒答时：本机 docs → 维基百科 → 诚实说明原因。"""
-    local = _search_local_docs(prompt_text, tool_dir)
-    if local:
-        _debug(req_id, f"research fallback hit local {len(local)} chars")
-        return "模型没直接掌握，但在项目文档里找到相关条目：\n" + local
+    """模型拒答时：（项目类问题）本机 docs → 维基百科 → 诚实说明原因。通用知识问题跳过本机 docs。"""
+    project_scoped = bool(_PROJECT_SCOPE_KEYWORDS.search(prompt_text))
+    local_reason = "通用问题，跳过本机 docs"
+    if project_scoped:
+        local = _search_local_docs(prompt_text, tool_dir)
+        if local:
+            _debug(req_id, f"research fallback hit local {len(local)} chars")
+            return "模型没直接掌握，但在项目文档里找到相关条目：\n" + local
+        local_reason = "本机文档未命中"
     wiki, reason = _wiki_lookup(prompt_text)
     if wiki:
         _debug(req_id, f"research fallback hit wiki len={len(wiki)}")
         return "模型没直接掌握，以下摘自维基百科（请自行验证）：\n" + wiki
-    _debug(req_id, f"research fallback gave up reason={reason}")
+    _debug(req_id, f"research fallback gave up local={local_reason} wiki={reason}")
     return (
         "我对这个问题没有把握。尝试过的查证：\n"
-        "- 本机项目文档：未命中\n"
+        f"- 本机项目文档：{local_reason}\n"
         f"- 维基百科中文：{reason}\n"
         "如果能提供更精确的关键词或上下文，我可以再试一次。"
     )
@@ -534,6 +578,21 @@ def _init_model(checkpoint: str, tool_dir: str):
                 else:
                     locations.append(f"- `{line}`")
             return "我找到的主要位置是：\n" + "\n".join(locations)
+
+        structure_triggers = {
+            "当前项目结构", "项目结构", "目录结构", "文件结构", "仓库结构",
+            "项目目录", "仓库目录", "代码结构",
+        }
+        if normalized in structure_triggers or any(k in normalized for k in ("项目结构", "目录结构", "文件结构", "仓库结构")):
+            _debug("repo-shortcut", "repo shortcut hit: project_structure")
+            # 优先读 docs/PROJECT_STRUCTURE.md，没有就 ls 项目根目录
+            ps = execute_tool("read_file", {"path": "docs/PROJECT_STRUCTURE.md", "offset": 1, "limit": 40}, tool_dir)
+            if ps and not ps.startswith("(文件不存在") and not ps.startswith("(路径越界"):
+                return "项目结构（取自 docs/PROJECT_STRUCTURE.md）：\n" + ps
+            root_list = execute_tool("read_file", {"path": ".", "offset": 1, "limit": 40}, tool_dir)
+            if root_list and not root_list.startswith("("):
+                return f"项目根目录 `{Path(tool_dir).resolve().name}` 下主要条目：\n" + root_list
+            return None
 
         return None
 
