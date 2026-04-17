@@ -216,7 +216,7 @@ def _init_model(checkpoint: str, tool_dir: str):
     src = "".join(lines[:cut])
 
     fake = types.ModuleType("prepare")
-    fake.MAX_SEQ_LEN = 2048
+    fake.MAX_SEQ_LEN = 2048  # 占位符：仅用于让 train.py 顶层 `from prepare import MAX_SEQ_LEN` 成功执行；推理时实际使用 ckpt["config"].sequence_len
     fake.TIME_BUDGET = 999999
     fake.Tokenizer = None
     fake.make_dataloader = None
