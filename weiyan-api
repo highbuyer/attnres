@@ -614,35 +614,42 @@ def _init_model(checkpoint: str, tool_dir: str):
             return None
 
         # 文件内容直读短路：匹配到形如 FOO.md / foo.py 的引用，且问句带 "内容/有什么/看一下/读" 意图
+        # 或整句除文件名外只剩 ≤4 字符（"X.py 呢" / "X.py?" / 孤立文件名），也视为读文件请求
         file_ref_match = _FILE_REF_RE.search(p)
-        if file_ref_match and any(k in normalized for k in ("内容", "有什么", "看一下", "看下", "读一下", "读下", "读", "讲了什么", "写了什么")):
+        intent_phrases = ("内容", "有什么", "看一下", "看下", "读一下", "读下", "读", "讲了什么", "写了什么", "呢")
+        if file_ref_match:
             rel = file_ref_match.group(1)
-            _debug("repo-shortcut", f"repo shortcut hit: file_read rel={rel}")
-            for try_path in (rel, f"docs/{rel}", f"src/{rel}", f"scripts/{rel}", f"tests/{rel}"):
-                content = execute_tool("read_file", {"path": try_path, "offset": 1, "limit": 40}, tool_dir)
-                if content and not content.startswith("(文件不存在") and not content.startswith("(路径越界"):
-                    return f"`{try_path}` 前 40 行：\n" + content
-            # 还是没找到：用 fd/find 按文件名全项目搜索
-            try:
-                located = subprocess.run(
-                    ["rg", "--files", "-g", rel],
-                    cwd=tool_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                )
-                hits = [line.strip() for line in located.stdout.splitlines() if line.strip()]
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                hits = []
-            if hits:
-                chosen = hits[0]
-                content = execute_tool("read_file", {"path": chosen, "offset": 1, "limit": 40}, tool_dir)
-                if content and not content.startswith("("):
-                    extra = ""
-                    if len(hits) > 1:
-                        extra = f"\n\n（仓库里还有其它同名文件：{', '.join(hits[1:4])}）"
-                    return f"`{chosen}` 前 40 行：\n{content}{extra}"
-            return f"`{rel}` 在项目里找不到。可能是路径不对或者这个文件不在当前仓库。"
+            residual = normalized.replace(rel.lower(), "", 1)
+            residual = re.sub(r"[\s？?！!。.，,;:：；]+", "", residual)
+            has_intent = any(k in normalized for k in intent_phrases)
+            is_tiny = len(residual) <= 4
+            if has_intent or is_tiny:
+                _debug("repo-shortcut", f"repo shortcut hit: file_read rel={rel} residual={residual!r}")
+                for try_path in (rel, f"docs/{rel}", f"src/{rel}", f"scripts/{rel}", f"tests/{rel}"):
+                    content = execute_tool("read_file", {"path": try_path, "offset": 1, "limit": 40}, tool_dir)
+                    if content and not content.startswith("(文件不存在") and not content.startswith("(路径越界"):
+                        return f"`{try_path}` 前 40 行：\n" + content
+                # 还是没找到：用 rg --files 按文件名全项目搜索
+                try:
+                    located = subprocess.run(
+                        ["rg", "--files", "-g", rel],
+                        cwd=tool_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
+                    hits = [line.strip() for line in located.stdout.splitlines() if line.strip()]
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    hits = []
+                if hits:
+                    chosen = hits[0]
+                    content = execute_tool("read_file", {"path": chosen, "offset": 1, "limit": 40}, tool_dir)
+                    if content and not content.startswith("("):
+                        extra = ""
+                        if len(hits) > 1:
+                            extra = f"\n\n（仓库里还有其它同名文件：{', '.join(hits[1:4])}）"
+                        return f"`{chosen}` 前 40 行：\n{content}{extra}"
+                return f"`{rel}` 在项目里找不到。可能是路径不对或者这个文件不在当前仓库。"
 
         return None
 
