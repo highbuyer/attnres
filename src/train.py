@@ -110,6 +110,10 @@ class GPTConfig:
     n_embd: int = 768
     window_pattern: str = "SSSL"
     rope_theta: float = 10000.0
+    # 以下字段向后兼容：老 ckpt 不含这些 key 时，_config_from_ckpt 会用这里的默认值
+    rope_seq_len_mult: int = 10  # rotary 预计算长度倍率；为长文本 NTK 扩展留余地。生产训练可降到 2
+    softcap: float = 15.0        # 输出 logit 的 tanh 软顶
+    tie_lm_head: bool = False    # True 时 lm_head.weight 与 wte.weight 共享（省 25M 参数）
 
 
 def norm(x):
@@ -240,6 +244,10 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if getattr(config, "tie_lm_head", False):
+            # lm_head 与 wte 共享权重；load_state_dict 时若 ckpt 里 lm_head.weight 独立存在，
+            # 则该独立张量会被替换（无 shape mismatch，但参数语义改变）——新一轮训练再开启
+            self.lm_head.weight = self.transformer.wte.weight
         # Block AttnRes: cross-layer attention residual (Kimi 2026, Block variant, exact paper design)
         # Exact paper design: proj is Linear(n_embd->1) used as pseudo-query; K=RMSNorm(V), no separate K projection
         # 2*n_layer projections: even indices for pre-attn, odd indices for pre-mlp
@@ -255,7 +263,7 @@ class GPT(nn.Module):
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
         # Rotary embeddings
-        self.rotary_seq_len = config.sequence_len * 10
+        self.rotary_seq_len = config.sequence_len * getattr(config, "rope_seq_len_mult", 10)
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -264,7 +272,8 @@ class GPT(nn.Module):
     def init_weights(self, *, cast_embeddings_to_bfloat16=True):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if not getattr(self.config, "tie_lm_head", False):
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -433,7 +442,7 @@ class GPT(nn.Module):
 
         x = norm(x)
 
-        softcap = 15
+        softcap = getattr(self.config, "softcap", 15.0)
         logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
