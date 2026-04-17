@@ -21,20 +21,179 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Lock
-
-# 加载推理引擎
+from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-_model = None
-_generate_fn = None
+
 _lock = Lock()
+MAX_GENERATE_TOKENS = 1024
+HEARTBEAT_EVERY_TOKENS = 128
+MAX_DECODE_SECONDS = 20
+_model = None
+_tokenizer = None
+_generate_fn = None
+
+
+def _debug(req_id: str, message: str):
+    sys.stderr.write(f"[weiyan][{req_id}] {message}\n")
+    sys.stderr.flush()
+
+
+def _preview(value, limit: int = 160) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = text.replace("\n", " ").replace("\r", " ")
+    return text[:limit]
+
+
+def _looks_like_startup_prompt(prompt_text: str) -> bool:
+    if len(prompt_text) < 8000:
+        return False
+    markers = [
+        "SessionStart hook additional context",
+        "EXTREMELY_IMPORTANT",
+        "superpowers:using-superpowers",
+        "<system-reminder>",
+        "Available tools:",
+        "tool_call",
+    ]
+    hits = sum(1 for marker in markers if marker in prompt_text)
+    return hits >= 2
+
+
+def _is_degenerate_output(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) < 64:
+        return False
+    allowed = {"-", "—", "_", " ", "\n", "\t", ".", "*"}
+    if all(ch in allowed for ch in stripped):
+        return True
+    segments = [seg for seg in stripped.replace("\n", " ").split(" ") if seg]
+    if len(segments) >= 20:
+        repetitive = sum(1 for seg in segments if seg in {"---", "—", "_", "***", "----"})
+        if repetitive / len(segments) >= 0.6:
+            return True
+    # n-gram 循环检测：1~6 长度的 n-gram 若连续重复 >=3 次即视为退化
+    if len(segments) >= 12:
+        for n in range(1, 7):
+            if len(segments) < n * 3:
+                continue
+            for start in range(len(segments) - n * 3 + 1):
+                gram = tuple(segments[start:start + n])
+                repeats = 1
+                pos = start + n
+                while pos + n <= len(segments) and tuple(segments[pos:pos + n]) == gram:
+                    repeats += 1
+                    pos += n
+                if repeats >= 3:
+                    return True
+    # 字符级窗口重复（英文/中文混合无空格时）：取 32 字符窗口若整段重复 >=3 次
+    if len(stripped) >= 96:
+        for window in (16, 24, 32, 48):
+            chunk = stripped[:window]
+            if chunk and stripped.count(chunk) >= 3:
+                return True
+    return False
+
+
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL | re.IGNORECASE)
+_LOCAL_CAVEAT_RE = re.compile(r"<local-command-caveat>.*?</local-command-caveat>", re.DOTALL | re.IGNORECASE)
+_COMMAND_BLOCK_RE = re.compile(
+    r"<(?:local-)?command-(?:name|message|args|stdout|stderr)>.*?</(?:local-)?command-(?:name|message|args|stdout|stderr)>",
+    re.DOTALL | re.IGNORECASE,
+)
+_EMPTY_TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9\-]*\s*/?>|</[a-zA-Z][a-zA-Z0-9\-]*>")
+_META_NOISE_PATTERNS = (_SYSTEM_REMINDER_RE, _LOCAL_CAVEAT_RE, _COMMAND_BLOCK_RE)
+
+
+def _sanitize_long_prompt(prompt_text: str, max_chars: int = 4000) -> str:
+    """剥离 system-reminder / local-command-* / command-* 等噪声块，并清理残留空标签。"""
+    if not prompt_text:
+        return prompt_text
+    cleaned = prompt_text
+    for pattern in _META_NOISE_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+    # 清掉任何残留的孤立开/闭标签（例如未配对的 <local-command-stdout> 壳）
+    cleaned = _EMPTY_TAG_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[-max_chars:]
+    return cleaned
+
+
+def _extract_responses_input(body) -> str:
+    data = body.get("input", "")
+    if isinstance(data, str):
+        return data.strip()
+
+    parts = []
+
+    def add_text(value):
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                parts.append(value)
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                add_text(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            content = item.get("content", "")
+            if isinstance(content, str):
+                add_text(content)
+                continue
+            if not isinstance(content, list):
+                continue
+
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in {"input_text", "text", "output_text"}:
+                    add_text(block.get("text", ""))
+
+    return "\n".join(parts).strip()
+
+
+
+def _tool_capability_answer(prompt_text: str):
+    normalized = re.sub(r"\s+", "", prompt_text).lower()
+
+    if any(key in normalized for key in [
+        "你能用哪些工具",
+        "有哪些工具",
+        "什么工具",
+        "你会哪些工具",
+        "read,search,bash",
+        "read,search,bash?",
+        "比如read,search,bash?",
+        "比如read,search,bash？",
+    ]):
+        return "我可以基于当前仓库做几类查询：1）搜索代码；2）读取文件；3）查看项目结构；4）在需要时执行受支持的命令。如果你要我直接查，请直接说目标，比如：`搜索 system_prompt 在哪`、`看 README`、`这个仓库做什么`。"
+
+    if any(key in normalized for key in [
+        "你用工具查询啊",
+        "直接搜索代码库",
+        "直接查代码",
+        "去搜代码",
+        "你可以直接搜索代码库",
+    ]):
+        return "可以。请直接告诉我你要查什么，我会按仓库内容给你结论。比如：某个函数在哪、某个配置在哪、这个仓库做什么。"
+
+    return None
 
 
 def _init_model(checkpoint: str, tool_dir: str):
@@ -119,85 +278,188 @@ def _init_model(checkpoint: str, tool_dir: str):
     tool_call_end_id = enc.encode_single_token("<|tool_call_end|>")
     TOOL_CALL_START = "<|tool_call_start|>"
 
-    system_prompt = "你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。"
+    system_prompt = "你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。通用知识问题直接回答，不要提当前工作目录或项目代码。只有当用户明确询问当前项目中的代码、文件、函数、类、配置或训练流程时，才考虑使用 search_code 和 read_file 工具查看项目代码。"
     if tool_dir:
         project_name = Path(tool_dir).resolve().name
-        system_prompt += f"\n当前工作目录: {tool_dir}（项目: {project_name}）。你可以使用 search_code 和 read_file 工具查看项目代码。"
+        system_prompt += f"\n当前项目名: {project_name}。仅当用户明确询问这个项目或项目中的文件/代码时，才基于项目代码回答。"
     system_ids = tokenizer.encode(system_prompt + "\n")
 
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    # 项目问答（同 infer.py）
+    # 仅处理极少量环境元信息问题，其他 repo 问题交给模型/工具决策
     def _project_answer(prompt_text):
         if not tool_dir:
             return None
         td = Path(tool_dir).resolve()
         p = prompt_text.strip()
-        if re.search(r"用.{0,4}(python|代码|脚本)|写.{0,3}(代码|脚本|程序)|查询|搜索|读取|打开|给我看|show|read|find", p, re.IGNORECASE):
-            return None
-        if re.search(r"(项目|attnres).{0,6}(是什么|做什么|干什么|干嘛|目标|目的|用途|功能|简介|介绍)", p, re.IGNORECASE):
-            return f"`{td.name}` 是一个 400M 参数的工具调用调度器项目。\n目标：训练小模型学会在合适时机调用 search_code / read_file 工具检索代码，并用自然语言总结结果。"
-        if re.search(r"(当前|这个).{0,4}(项目|目录|路径)|项目.{0,4}(目录|路径)|你在哪|工作目录", p, re.IGNORECASE):
-            dirs = [e.name for e in sorted(td.iterdir()) if e.is_dir() and not e.name.startswith(".")]
-            return f"当前项目是 `{td.name}`，路径 `{td}`。\n主要目录：{', '.join(dirs)}"
-        if re.search(r"项目.{0,6}(进度|状态|进展)", p, re.IGNORECASE):
-            progress = td / "docs" / "PROGRESS.md"
-            if progress.exists():
-                lines = progress.read_text(encoding="utf-8").splitlines()
-                state_lines = []
-                in_state = False
-                for line in lines[:50]:
-                    if "当前状态" in line:
-                        in_state = True
-                    elif in_state and line.startswith("## "):
-                        break
-                    if in_state:
-                        state_lines.append(line)
-                if state_lines:
-                    return "\n".join(state_lines)
-        if re.search(r"项目.{0,4}(结构|源码)|目录.{0,4}(文件|功能)|各.{0,3}目录", p, re.IGNORECASE):
-            parts = [f"项目 `{td.name}` 结构："]
-            for subdir, label in [("src", "核心模块"), ("scripts", "脚本"), ("docs", "文档"), ("tests", "测试")]:
-                d = td / subdir
-                if d.is_dir():
-                    files = sorted(f.name for f in d.iterdir() if f.suffix in (".py", ".md"))
-                    if files:
-                        parts.append(f"  {subdir}/ ({len(files)} 个{label}): {', '.join(files)}")
-            return "\n".join(parts)
+        if re.search(r"当前工作目录|当前目录|工作路径|project.?dir|\bpwd\b|你现在在哪个目录", p, re.IGNORECASE):
+            return f"当前工作目录是 `{td}`，项目名是 `{td.name}`。"
+
         return None
 
-    def generate(prompt_text: str, max_tokens: int = 256, temperature: float = 0.0) -> str:
+    def _repo_answer(prompt_text):
+        if not tool_dir:
+            return None
+        p = prompt_text.strip()
+        normalized = re.sub(r"\s+", "", p).lower()
+
+        if normalized in {
+            "这个仓库做什么",
+            "这个项目做什么",
+            "这个仓库干什么",
+            "这个项目干什么",
+            "这个仓库是干嘛的",
+            "这个项目是干嘛的",
+            "仓库介绍",
+            "项目介绍",
+            "仓库用途",
+            "项目用途",
+        }:
+            _debug("repo-shortcut", "repo shortcut hit: repo_summary")
+            candidates = [
+
+                "docs/README.md",
+                "README.md",
+                "docs/PROJECT_STRUCTURE.md",
+                "docs/PREPARE_README.md",
+                "docs/SFT_README.md",
+                "docs/CONTINUE_PRETRAIN_README.md",
+            ]
+            snippets = []
+            for rel_path in candidates:
+                result = execute_tool("read_file", {"path": rel_path, "offset": 1, "limit": 24}, tool_dir)
+                if result.startswith("(文件不存在") or result.startswith("(路径越界"):
+                    continue
+                if result.strip():
+                    snippets.append((rel_path, result))
+                if len(snippets) >= 2:
+                    break
+            if snippets:
+                parts = ["我先从仓库文件里看到这些信息："]
+                for rel_path, content in snippets:
+                    preview = "\n".join(content.splitlines()[:5]).strip()
+                    parts.append(f"- `{rel_path}`\n{preview}")
+                return "\n\n".join(parts)
+
+            return None
+
+        if normalized in {"systemprompt在哪", "systemprompt在哪里", "提示词在哪", "提示词在哪里"}:
+            _debug("repo-shortcut", "repo shortcut hit: system_prompt_location")
+            result = execute_tool("search_code", {"query": "system_prompt"}, tool_dir)
+            if not result or result.startswith("(未找到匹配"):
+                return None
+            lines = [line.strip() for line in result.splitlines() if line.strip()][:3]
+            if not lines:
+                return None
+            locations = []
+            for line in lines:
+                path_part, _, remainder = line.partition(":")
+                line_no, _, _ = remainder.partition(":")
+                if path_part and line_no.isdigit():
+                    locations.append(f"- `{path_part}:{line_no}`")
+                else:
+                    locations.append(f"- `{line}`")
+            return "我找到的主要位置是：\n" + "\n".join(locations)
+
+        return None
+
+    def generate(prompt_text: str, max_tokens: int = 256, temperature: float = 0.0, req_id: str = "-") -> str:
+        if max_tokens > MAX_GENERATE_TOKENS:
+            _debug(req_id, f"clamp max_tokens from {max_tokens} to {MAX_GENERATE_TOKENS}")
+            max_tokens = MAX_GENERATE_TOKENS
+
         hard_rule = apply_hard_rules(prompt_text)
+
         if hard_rule:
             return hard_rule
+        meaningful = re.sub(r"[\s<>/\-_*#`\[\]\(\)]+", "", prompt_text)
+        if len(meaningful) < 2:
+            _debug(req_id, f"empty prompt short-circuit hit meaningful_len={len(meaningful)}")
+            return "你好，请直接输入你的问题，例如：这个仓库做什么？"
+        _greeting_norm = meaningful.lower()
+        if _greeting_norm in {"你好", "您好", "hi", "hello", "hey", "在吗", "在", "嗨"}:
+            _debug(req_id, f"greeting short-circuit hit norm={_greeting_norm!r}")
+            return "你好！我是微研。你可以问我这个仓库的结构、代码位置，或者让我查某个函数/文件。"
+        if re.search(r"今天.*?(几号|日期|星期|几月|几日)|现在.*?(几点|时间)|当前.*?(时间|日期)|what.*?(date|time).*?(today|now)", prompt_text, re.IGNORECASE):
+            _debug(req_id, "datetime short-circuit hit")
+            return "我是一个本地模型，没有联网也没法拿系统时钟，所以不知道当前日期和时间。你可以看看终端/任务栏上的时间。"
+        if _looks_like_startup_prompt(prompt_text):
+            _debug(req_id, "startup prompt short-circuit hit")
+            return "已收到系统启动上下文。请直接告诉我你的具体问题，例如：这个仓库做什么？"
+        tool_cap = _tool_capability_answer(prompt_text)
+        if tool_cap:
+            _debug(req_id, "tool capability shortcut hit")
+            return tool_cap
         proj = _project_answer(prompt_text)
         if proj:
             return proj
+        repo = _repo_answer(prompt_text)
+        if repo:
+            return repo
+
+        # 服务端强制开启轻量采样 + top_p + no_repeat_ngram，避免贪婪解码陷入循环吸子
+        effective_temperature = temperature if temperature > 0 else 0.7
+        top_p = 0.9
+        no_repeat_ngram = 4
 
         prompt_ids = [bos_id, user_id] + system_ids + tokenizer.encode(prompt_text) + [asst_id]
         x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         generated_ids = []
         last_tool_result = None
+        timed_out = False
+        gen_t0 = time.time()
+        _debug(req_id, f"generate start prompt_len={len(prompt_text)} max_tokens={max_tokens} temp={temperature}(eff={effective_temperature}) prompt={_preview(prompt_text)!r}")
+
 
         tool_result_start_tag = "<|tool_result_start|>"
+
         tool_result_end_tag = "<|tool_result_end|>"
 
         for _round in range(4):
             round_ids = []
-            for _ in range(max_tokens):
+            round_flushed = False
+            round_t0 = time.time()
+            _debug(req_id, f"round={_round + 1} decode start context_tokens={x.shape[1]}")
+            for step in range(max_tokens):
+
+                if time.time() - gen_t0 >= MAX_DECODE_SECONDS:
+                    timed_out = True
+                    _debug(req_id, f"decode timeout after {time.time() - gen_t0:.2f}s generated={len(round_ids)} round={_round + 1}")
+                    generated_ids.extend(round_ids)
+                    round_flushed = True
+                    break
+
+                if step and step % HEARTBEAT_EVERY_TOKENS == 0:
+                    _debug(req_id, f"round={_round + 1} heartbeat generated={step} context_tokens={x.shape[1]}")
+
                 with torch.no_grad(), autocast_ctx:
+
                     logits = model(x[:, -config.sequence_len:])[:, -1, :]
-                if temperature <= 0:
-                    next_id = torch.argmax(logits, dim=-1, keepdim=True)
-                else:
-                    logits = logits / temperature
-                    probs = torch.softmax(logits, dim=-1)
-                    next_id = torch.multinomial(probs, num_samples=1)
+
+                # no_repeat_ngram: 禁掉会造成 n-gram 重复的 token
+                if no_repeat_ngram > 1 and len(round_ids) >= no_repeat_ngram - 1:
+                    prefix = tuple(round_ids[-(no_repeat_ngram - 1):])
+                    banned = []
+                    for i in range(len(round_ids) - no_repeat_ngram + 1):
+                        if tuple(round_ids[i:i + no_repeat_ngram - 1]) == prefix:
+                            banned.append(round_ids[i + no_repeat_ngram - 1])
+                    if banned:
+                        logits[0, banned] = float("-inf")
+
+                logits_scaled = logits / effective_temperature
+                # top_p 核采样
+                sorted_logits, sorted_idx = torch.sort(logits_scaled, descending=True, dim=-1)
+                cum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                mask = cum_probs > top_p
+                mask[..., 0] = False  # 至少保留最高概率的 token
+                sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
+                filtered = torch.full_like(logits_scaled, float("-inf")).scatter_(-1, sorted_idx, sorted_logits)
+                probs = torch.softmax(filtered, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
                 token_id = int(next_id.item())
 
                 if tool_call_end_id and token_id == tool_call_end_id:
                     round_ids.append(token_id)
-                    generated_ids.extend(round_ids)
                     x = torch.cat([x, next_id], dim=1)
                     break
                 if token_id in stop_ids:
@@ -206,9 +468,14 @@ def _init_model(checkpoint: str, tool_dir: str):
                 x = torch.cat([x, next_id], dim=1)
             else:
                 generated_ids.extend(round_ids)
+                round_flushed = True
+                break
+
+            if timed_out:
                 break
 
             decoded = tokenizer.decode(round_ids)
+            _debug(req_id, f"round={_round + 1} decode done elapsed={time.time() - round_t0:.2f}s tokens={len(round_ids)} text={_preview(decoded)!r}")
             tool_parsed = None
             if round_ids and round_ids[-1] == tool_call_end_id:
                 tool_parsed = parse_tool_call(decoded)
@@ -217,7 +484,17 @@ def _init_model(checkpoint: str, tool_dir: str):
 
             if tool_parsed and tool_dir:
                 tool_name, params = tool_parsed
-                result = execute_tool(tool_name, params, tool_dir)
+                _debug(req_id, f"tool detected round={_round + 1} name={tool_name} args={_preview(params)!r}")
+                tool_t0 = time.time()
+                try:
+                    result = execute_tool(tool_name, params, tool_dir)
+                    _debug(req_id, f"tool done name={tool_name} elapsed={time.time() - tool_t0:.2f}s result={_preview(result)!r}")
+                except Exception as exc:
+                    result = f"[tool_error] {exc}"
+                    _debug(req_id, f"tool error name={tool_name} elapsed={time.time() - tool_t0:.2f}s error={_preview(result)!r}")
+                if not round_flushed:
+                    generated_ids.extend(round_ids)
+                    round_flushed = True
                 result_text = f"{tool_result_start_tag}{result}{tool_result_end_tag}"
                 result_ids = [asst_id] + enc.encode(result_text, allowed_special="all") + [asst_id]
                 generated_ids.extend(result_ids)
@@ -226,7 +503,9 @@ def _init_model(checkpoint: str, tool_dir: str):
                 last_tool_result = result
                 continue
             else:
-                generated_ids.extend(round_ids)
+                if not round_flushed:
+                    generated_ids.extend(round_ids)
+                    round_flushed = True
                 break
 
         result = strip_tool_markup(tokenizer.decode(generated_ids))
@@ -237,9 +516,37 @@ def _init_model(checkpoint: str, tool_dir: str):
         for tag in ["<|reserved_0|>", "<|reserved_1|>", "<|reserved_2|>", "<|reserved_3|>"]:
             result = result.replace(tag, "")
         result = result.strip()
+        if timed_out:
+            if result:
+                result = result + "\n\n[server note] Generation stopped early due to decode timeout."
+            else:
+                result = "[server note] Generation stopped early due to decode timeout."
+
+        if _is_degenerate_output(result):
+            _debug(req_id, f"degenerate output detected output={_preview(result)!r}")
+            # 区分两种场景：输入本身是协议噪声 vs 真实问题模型答不上来
+            meaningful_prompt = re.sub(r"[\s<>/\-_*#`\[\]\(\)]+", "", prompt_text)
+            if len(meaningful_prompt) < 20:
+                result = "这个问题我暂时答不好。你可以换个说法，或者让我查仓库里的内容（例如：某个函数在哪、README 讲了什么）。"
+            else:
+                result = "我收到了请求，但当前输入主要是系统启动或工具上下文，暂时没有生成有效回答。请直接输入你的问题，例如：这个仓库做什么？"
+
         if not result and last_tool_result:
             first_line = last_tool_result.split("\n", 1)[0].strip()
-            result = f"根据搜索结果，我找到了相关位置，首条匹配是：`{first_line}`。"
+            lowered = last_tool_result.lower()
+            invalid_markers = [
+                "未找到匹配",
+                "文件不存在",
+                "工具执行错误",
+                "tool_error",
+                "invalid literal",
+                "Traceback",
+            ]
+            if any(marker in last_tool_result for marker in invalid_markers) or "error" in lowered:
+                result = first_line or "工具没有返回可用结果。"
+            elif first_line:
+                result = f"我查到了相关结果，但还没来得及整理成自然语言回答。首条结果：`{first_line}`。"
+        _debug(req_id, f"generate done output_len={len(result)} output={_preview(result)!r}")
         return result
 
     _generate_fn = generate
@@ -256,19 +563,36 @@ class WeiyanHandler(BaseHTTPRequestHandler):
             self._json_response({"message": "微研 API. POST /v1/chat/completions 或 /ask"})
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
+        req_id = uuid.uuid4().hex[:8]
+        req_t0 = time.time()
+        path = urlparse(self.path).path
 
-        if self.path == "/ask":
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(length) if length else b"{}"
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            _debug(req_id, f"client disconnected while reading request path={path} error={exc}")
+            return
+
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            _debug(req_id, f"bad json path={path} error={exc}")
+            self._json_response({"error": {"message": "Invalid JSON body"}}, status=400)
+            return
+
+        if path == "/ask":
             prompt = body.get("prompt", "")
+            prompt_text = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
             max_tokens = body.get("max_tokens", 256)
             temperature = body.get("temperature", 0.0)
-        elif self.path in ("/v1/chat/completions", "/chat/completions"):
+        elif path in ("/v1/chat/completions", "/chat/completions"):
             messages = body.get("messages", [])
             prompt = messages[-1]["content"] if messages else ""
+            prompt_text = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
             max_tokens = body.get("max_tokens", 256)
             temperature = body.get("temperature", 0.0)
-        elif self.path.startswith("/v1/messages"):
+        elif path.startswith("/v1/messages"):
             # Anthropic API 格式（Claude Code 用这个）
             messages = body.get("messages", [])
             prompt = ""
@@ -278,18 +602,32 @@ class WeiyanHandler(BaseHTTPRequestHandler):
                     content = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
                 if msg.get("role") == "user":
                     prompt = content
+            prompt_text = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
+            raw_len = len(prompt_text)
+            prompt_text = _sanitize_long_prompt(prompt_text, max_chars=4000)
+            if raw_len != len(prompt_text):
+                _debug(req_id, f"sanitize prompt raw_len={raw_len} -> {len(prompt_text)}")
             max_tokens = body.get("max_tokens", 256)
-            temperature = body.get("temperature", 0.0)
+            temperature = min(float(body.get("temperature", 0.0)), 0.2)
+
+
+        elif path == "/v1/responses":
+            prompt_text = _extract_responses_input(body)
+            max_tokens = int(body.get("max_output_tokens") or body.get("max_tokens") or 256)
+            temperature = float(body.get("temperature", 0.0))
         else:
-            self.send_error(404)
+            _debug(req_id, f"404 path={path}")
+            self._json_response({"error": {"message": f"Route {path} not found"}}, status=404)
             return
 
+        _debug(req_id, f"recv path={path} body_keys={list(body.keys())} max_tokens={max_tokens} temp={temperature} prompt={_preview(prompt_text)!r}")
         with _lock:
-            answer = _generate_fn(prompt, max_tokens=max_tokens, temperature=temperature)
+            answer = _generate_fn(prompt_text, max_tokens=max_tokens, temperature=temperature, req_id=req_id)
+        _debug(req_id, f"request done path={path} total={time.time() - req_t0:.2f}s response_len={len(answer)}")
 
-        if self.path == "/ask":
+        if path == "/ask":
             self._json_response({"response": answer})
-        elif self.path.startswith("/v1/messages"):
+        elif path.startswith("/v1/messages"):
             # Anthropic 格式响应
             self._json_response({
                 "id": f"msg_{uuid.uuid4().hex[:12]}",
@@ -300,6 +638,24 @@ class WeiyanHandler(BaseHTTPRequestHandler):
                 "stop_reason": "end_turn",
                 "stop_sequence": None,
                 "usage": {"input_tokens": 0, "output_tokens": 0},
+            })
+        elif path == "/v1/responses":
+            self._json_response({
+                "id": f"resp_{uuid.uuid4().hex[:12]}",
+                "object": "response",
+                "status": "completed",
+                "model": "weiyan-400m",
+                "output": [{
+                    "type": "message",
+                    "id": f"msg_{uuid.uuid4().hex[:12]}",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": answer,
+                        "annotations": [],
+                    }],
+                }],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             })
         else:
             self._json_response({
@@ -314,6 +670,8 @@ class WeiyanHandler(BaseHTTPRequestHandler):
                 }],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             })
+
+
 
     def _json_response(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -335,7 +693,7 @@ def main():
     parser = argparse.ArgumentParser(description="微研 API Server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--checkpoint", default=str(ROOT / "checkpoints" / "sft_tool_summary_v4_best.pt"))
+    parser.add_argument("--checkpoint", default=str(ROOT / "checkpoints" / "sft_tool_summary_v5_best.pt"))
     parser.add_argument("--tool-dir", default=str(ROOT))
     args = parser.parse_args()
 
