@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 import infer  # noqa: E402
-from inference_rules import apply_hard_rules  # noqa: E402
+from inference_rules import apply_hard_rules, should_ban_tool  # noqa: E402
 from prepare import Tokenizer  # noqa: E402
 from tool_protocol import parse_tool_call  # noqa: E402
 
@@ -146,6 +146,12 @@ def generate_raw(model, config, tokenizer, device, prompt: str, max_tokens: int 
     user_id = enc.encode_single_token("<|reserved_1|>")
     asst_id = enc.encode_single_token("<|reserved_2|>")
     stop_ids = {enc.encode_single_token(t) for t in ["<|reserved_0|>", "<|reserved_1|>", "<|reserved_2|>", "<|reserved_3|>"]}
+    # w3: 常识类题禁 tool_call（详见 docs/W2_POSTMORTEM.md）
+    try:
+        tool_call_start_id = enc.encode_single_token("<|tool_call_start|>")
+    except Exception:
+        tool_call_start_id = None
+    ban_tool = should_ban_tool(prompt) and tool_call_start_id is not None
     sys_prompt = "你是微研，一个技术助手。用与用户相同的语言简洁回答。不确定时如实说明，不编造事实。拒绝有害内容。"
     sys_ids = tokenizer.encode(sys_prompt + "\n")
     x = torch.tensor([[bos, user_id, *sys_ids, *tokenizer.encode(prompt), asst_id]], dtype=torch.long, device=device)
@@ -154,6 +160,8 @@ def generate_raw(model, config, tokenizer, device, prompt: str, max_tokens: int 
     for _ in range(max_tokens):
         with torch.no_grad(), auto:
             logits = model(x[:, -config.sequence_len:])[:, -1, :]
+        if ban_tool and not gen:
+            logits[0, tool_call_start_id] = float("-inf")
         if gen:
             for tid in set(gen):
                 if logits[0, tid] > 0:

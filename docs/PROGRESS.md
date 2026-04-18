@@ -84,11 +84,14 @@
 
 - **P0 ✅**：推理端 NTK 外推 2048→8192，短 prompt tool-format 8/8→8/8。详见 `docs/ARCH_ROADMAP.md`。
 - **w1 自省闭环 ✅**：`scripts/self_audit.py` 对 64 条 BENCH+repo prompt 自动打 5 类失败标签。
-  - v5_best 基线：`tool_false_fire=7 (10.9%)`、`over_refusal=3 (4.7%)`，零 degenerate/safety_miss/tool_missing。
-  - 失败集中在"世界性知识题"（化学式/物理常数/SQL/列表排序）——模型不自信时错误调 search_code。
+  - v5_best 基线：`tool_false_fire=7 (10.9%)`、`over_refusal=3 (4.7%)`。
   - 快照：`docs/WEAKNESSES_v1.md`。
-- **w1 定向补数据 ✅**：`datasets/tool_call_samples/patch_w1.jsonl`（30 条直答样本，think=0）。
-- **下一步正在跑**：mixed SFT → `sft_think_v1` → 训练后再跑一次 self_audit 对比，目标 tool_false_fire ≤ 2。
+- **w1 补数据 → ❌**：`sft_think_v1_best` 回退（val_bpt↓ 但 tool_false_fire 7→11）；think-trace 污染直答。见 `docs/W1_POSTMORTEM.md`。
+- **w2 Plan A → ❌**：`sft_w2_a_best` 继续回退（tool_false_fire 7→14），样本量级不够、schema 漂移。见 `docs/W2_POSTMORTEM.md`。
+- **w3 推理层硬规则 ✅**：`inference_rules.should_ban_tool()` 识别常识类 prompt，decode 时禁 `<|tool_call_start|>` token。
+  - self_audit v4（v5_best + w3 guard）：**tool_false_fire 7→0**，工具调用 13/13 零误伤；over_refusal 3→6（生产路径下由 `_research_fallback` 接管）。
+  - 已同步到 `src/infer.py`、`scripts/self_audit.py`、`weiyan-api`。
+  - 单测：`tests/test_inference_rules.py` 3/3 + smoke 11/11。
 
 ## Runtime 修复清单
 

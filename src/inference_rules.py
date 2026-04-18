@@ -24,6 +24,45 @@ SAFETY_PATTERNS = [
 SAFETY_RESPONSE = "抱歉，我无法提供这类信息。如果你有技术方面的问题，我很乐意帮忙。"
 
 
+# w3 (2026-04-18): "常识类" prompt 识别 —— 命中且非项目 scope 时在 decode 阶段禁掉
+# <|tool_call_start|> token，强制模型走直答，解决 tool_false_fire（v1/v2/v3 单调恶化）。
+# SFT 加数据的路线失败（30-1500 条对抗 7126 条工具样本 + 400M 模型深度刻入的触发模式根本不够，
+# 详见 docs/W1_POSTMORTEM.md / W2_POSTMORTEM.md），改走推理层硬规则。
+_PROJECT_SCOPE_RE = re.compile(
+    r"(项目|仓库|代码|文件|函数|类|脚本|模块|目录|路径|配置|checkpoint|weiyan|微研|attnres|sft|infer|train|eval|tokenizer|分词|架构|流程|里有什么|写了什么|里面是什么|"
+    r"\.(?:py|md|json|jsonl|toml|yaml|yml|txt|sh|cfg))",
+    re.IGNORECASE,
+)
+
+_BAN_TOOL_PATTERNS = [
+    re.compile(r"(化学式|化学成分|分子式|结构式)", re.IGNORECASE),
+    re.compile(r"(光速|引力|常数|方程|定律|万有引力|阿伏伽德罗|普朗克)", re.IGNORECASE),
+    re.compile(r"(作者是谁|作者叫|谁.{0,4}写的|谁.{0,4}创作|谁发明|提出了.{0,6}(理论|学说|定律)|创立了)", re.IGNORECASE),
+    re.compile(r"(大约.{0,4}是多少|约等于多少|等于(几|多少)|有多少(天|秒|分钟|小时|行星|染色体))", re.IGNORECASE),
+    re.compile(r"(的区别|的差别|有什么不同|有何不同|哪个(更好|更适合|人口更多|更快|更大|更合适))", re.IGNORECASE),
+    re.compile(r"(排序后|排序结果|去重后|\[.*\][，,].{0,4}排序|从(大|小|高|低)到(小|大|低|高))", re.IGNORECASE),
+    re.compile(r"(著名景点|景点有|名胜|旅游景点)", re.IGNORECASE),
+    re.compile(r"(最高.{0,2}山峰|最长.{0,2}(河流|河|江)|最深.{0,2}海沟|世界上最|最大.{0,4}(国家|城市))", re.IGNORECASE),
+    re.compile(r"(首都是|人口是多少|人口最多)", re.IGNORECASE),
+    re.compile(r"(提出了什么|最著名|贡献是什么)", re.IGNORECASE),
+    re.compile(r"(讲.{0,2}个笑话|推荐.{0,4}(本|部).{0,4}书|哪些书)", re.IGNORECASE),
+    re.compile(r"(一.{0,2}(天|年|月|小时|分钟).{0,4}(多少|是多久))", re.IGNORECASE),
+]
+
+
+def should_ban_tool(prompt: str) -> bool:
+    """判断 prompt 是否属于"世界知识类"题，不应触发 tool_call。
+
+    规则：命中 _BAN_TOOL_PATTERNS 且不含项目 scope 关键词 → 返回 True。
+    推理层据此在 decode 时对 <|tool_call_start|> token 做 logit mask。
+    """
+    if not prompt:
+        return False
+    if _PROJECT_SCOPE_RE.search(prompt):
+        return False
+    return any(p.search(prompt) for p in _BAN_TOOL_PATTERNS)
+
+
 def check_identity(prompt: str) -> str | None:
     for pattern, answer in IDENTITY_PATTERNS:
         if pattern.search(prompt):

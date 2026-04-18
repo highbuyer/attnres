@@ -615,7 +615,7 @@ def _init_model(checkpoint: str, tool_dir: str):
 
     # 构建 generate 函数（复用 infer.py 的逻辑）
     import re
-    from inference_rules import apply_hard_rules
+    from inference_rules import apply_hard_rules, should_ban_tool
     from tool_protocol import execute_tool, parse_tool_call, strip_tool_markup
 
     tokenizer = Tokenizer.from_directory()
@@ -828,6 +828,14 @@ def _init_model(checkpoint: str, tool_dir: str):
         gen_t0 = time.time()
         _debug(req_id, f"generate start prompt_len={len(prompt_text)} max_tokens={max_tokens} temp={temperature}(eff={effective_temperature}) prompt={_preview(prompt_text)!r}")
 
+        # w3: 常识类题在 decode 阶段禁 <|tool_call_start|>，避免 tool_false_fire（详见 docs/W2_POSTMORTEM.md）
+        try:
+            tool_call_start_id = enc.encode_single_token("<|tool_call_start|>")
+        except Exception:
+            tool_call_start_id = None
+        ban_tool = should_ban_tool(prompt_text) and tool_call_start_id is not None
+        if ban_tool:
+            _debug(req_id, "w3 ban_tool active — <|tool_call_start|> logit masked")
 
         tool_result_start_tag = "<|tool_result_start|>"
 
@@ -853,6 +861,11 @@ def _init_model(checkpoint: str, tool_dir: str):
                 with torch.no_grad(), autocast_ctx:
 
                     logits = model(x[:, -INFER_MAX_CONTEXT:])[:, -1, :]
+
+                # w3: 若 prompt 命中 should_ban_tool 且仍在第一轮第一段生成（未见任何 token），
+                # 强制禁掉 <|tool_call_start|>；后续轮次（如工具结果后的 summary）不干预
+                if ban_tool and _round == 0 and not round_ids:
+                    logits[0, tool_call_start_id] = float("-inf")
 
                 # no_repeat_ngram: 禁掉会造成 n-gram 重复的 token
                 if no_repeat_ngram > 1 and len(round_ids) >= no_repeat_ngram - 1:

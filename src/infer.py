@@ -74,7 +74,7 @@ GPT.__module__ = '__main__'
 GPTConfig.__module__ = '__main__'
 
 from prepare import SPECIAL_TOKENS, Tokenizer  # noqa: E402
-from inference_rules import apply_hard_rules  # noqa: E402
+from inference_rules import apply_hard_rules, should_ban_tool  # noqa: E402
 from infer_support import ensure_inference_backend  # noqa: E402
 from project_paths import resolve_default_checkpoint  # noqa: E402
 from tool_protocol import execute_tool, parse_tool_call, strip_tool_markup  # noqa: E402
@@ -294,10 +294,13 @@ def main() -> None:
 
         # 工具调用 token IDs
         tool_call_end_id = enc.encode_single_token('<|tool_call_end|>') if '<|tool_call_end|>' in SPECIAL_TOKENS else None
+        tool_call_start_id = enc.encode_single_token('<|tool_call_start|>') if '<|tool_call_start|>' in SPECIAL_TOKENS else None
         tool_result_start_tag = '<|tool_result_start|>'
         tool_result_end_tag = '<|tool_result_end|>'
         TOOL_CALL_START = '<|tool_call_start|>'
         max_tool_rounds = 3  # 最多执行 3 轮工具调用
+        # w3: 常识类题禁用 tool_call，避免 tool_false_fire（详见 docs/W2_POSTMORTEM.md）
+        ban_tool = should_ban_tool(prompt) and tool_call_start_id is not None and not args.no_tools
 
         for _tool_round in range(max_tool_rounds + 1):
             # 生成直到遇到 stop token
@@ -307,6 +310,11 @@ def main() -> None:
                 with torch.no_grad(), autocast_ctx:
                     logits = model(x[:, -max_context:])
                     logits = logits[:, -1, :]
+
+                # w3: 若 prompt 命中 should_ban_tool 且还未开始生成任何 tool_call，
+                # 强制禁掉 <|tool_call_start|> token；已经开始的 tool_call 不干预（保留 partial 兼容）
+                if ban_tool and _tool_round == 0 and not round_ids:
+                    logits[0, tool_call_start_id] = float("-inf")
 
                 if args.rep_penalty != 1.0 and (generated_ids or round_ids):
                     for tok_id in set(generated_ids + round_ids):
