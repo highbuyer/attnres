@@ -46,6 +46,98 @@ RESEARCH_HTTP_TIMEOUT = 5  # 秒；联网查证单次请求上限
 _model = None
 _tokenizer = None
 _generate_fn = None
+_audit_log_path: str | None = None  # --audit-log 指定时写入的 JSONL 路径
+
+
+# ---- Session memory & audit log ----------------------------------------------
+SESSION_FILENAME = ".weiyan-session.json"
+SESSION_RECENT_MAX = 8
+
+
+def _session_path(tool_dir: str | None) -> Path | None:
+    if not tool_dir:
+        return None
+    return Path(tool_dir) / SESSION_FILENAME
+
+
+def _session_load(tool_dir: str | None) -> dict:
+    p = _session_path(tool_dir)
+    if not p or not p.exists():
+        return {"recent_queries": [], "recent_files": [], "recent_shortcuts": []}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"recent_queries": [], "recent_files": [], "recent_shortcuts": []}
+
+
+def _session_save(tool_dir: str | None, data: dict) -> None:
+    p = _session_path(tool_dir)
+    if not p:
+        return
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # 写失败静默，session 是 best-effort
+
+
+def _session_record(tool_dir: str | None, *, query: str | None = None,
+                    file_ref: str | None = None, shortcut: str | None = None) -> None:
+    if not tool_dir:
+        return
+    data = _session_load(tool_dir)
+    if query:
+        q = query.strip()[:200]
+        if q and (not data["recent_queries"] or data["recent_queries"][-1] != q):
+            data["recent_queries"].append(q)
+            data["recent_queries"] = data["recent_queries"][-SESSION_RECENT_MAX:]
+    if file_ref:
+        if file_ref in data["recent_files"]:
+            data["recent_files"].remove(file_ref)
+        data["recent_files"].append(file_ref)
+        data["recent_files"] = data["recent_files"][-SESSION_RECENT_MAX:]
+    if shortcut:
+        data["recent_shortcuts"].append({"t": int(time.time()), "kind": shortcut})
+        data["recent_shortcuts"] = data["recent_shortcuts"][-SESSION_RECENT_MAX:]
+    _session_save(tool_dir, data)
+
+
+def _session_resolve_file_ref(prompt_text: str, tool_dir: str | None) -> str | None:
+    """若 prompt 是"那 X 呢" / "X 是什么意思"这种省略了文件的跟进问，
+    从 session.recent_files 里拿最近用过的文件名当默认引用。
+    只在 prompt 里已经有"那/呢/是什么"这些指代词时触发。
+    """
+    if not tool_dir or not prompt_text:
+        return None
+    normalized = re.sub(r"\s+", "", prompt_text)
+    # 长度 <=6 且含指代词 → 很可能是省略追问
+    if len(normalized) > 12:
+        return None
+    if not any(k in normalized for k in ("那", "它", "这个", "刚才", "上面", "前面", "呢")):
+        return None
+    data = _session_load(tool_dir)
+    if data["recent_files"]:
+        return data["recent_files"][-1]
+    return None
+
+
+def _audit_log(req_id: str, path: str, prompt: str, outcome: str, answer: str, elapsed_s: float) -> None:
+    """写审计日志（JSONL 单行）。_audit_log_path 未设置则是 no-op。"""
+    if not _audit_log_path:
+        return
+    rec = {
+        "t": int(time.time()),
+        "req_id": req_id,
+        "path": path,
+        "prompt": prompt[:500],
+        "outcome": outcome,
+        "answer": answer[:500],
+        "elapsed_s": round(elapsed_s, 3),
+    }
+    try:
+        with open(_audit_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # 审计失败不阻塞业务
 
 
 # SFT 训练过的"拒答"模板，命中则走 _research_fallback
@@ -918,7 +1010,20 @@ class WeiyanHandler(BaseHTTPRequestHandler):
         _debug(req_id, f"recv path={path} body_keys={list(body.keys())} max_tokens={max_tokens} temp={temperature} prompt={_preview(prompt_text)!r}")
         with _lock:
             answer = _generate_fn(prompt_text, max_tokens=max_tokens, temperature=temperature, req_id=req_id)
-        _debug(req_id, f"request done path={path} total={time.time() - req_t0:.2f}s response_len={len(answer)}")
+        elapsed = time.time() - req_t0
+        _debug(req_id, f"request done path={path} total={elapsed:.2f}s response_len={len(answer)}")
+        # Session + audit：记录本轮，方便跨请求引用与后续数据回捞
+        try:
+            tool_dir_for_session = getattr(self.server, "tool_dir", None)
+            file_match = _FILE_REF_RE.search(prompt_text) if prompt_text else None
+            _session_record(
+                tool_dir_for_session,
+                query=prompt_text,
+                file_ref=file_match.group(1) if file_match else None,
+            )
+            _audit_log(req_id, path, prompt_text, outcome="ok", answer=answer, elapsed_s=elapsed)
+        except Exception as exc:
+            _debug(req_id, f"session/audit write failed: {exc}")
 
         if path == "/ask":
             self._json_response({"response": answer})
@@ -990,7 +1095,14 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint", default=str(ROOT / "checkpoints" / "sft_tool_summary_v5_best.pt"))
     parser.add_argument("--tool-dir", default=str(ROOT))
+    parser.add_argument("--audit-log", default=None,
+                        help="若指定，把每次请求（含 prompt / outcome / 用时）按 JSONL 追加到该路径，用于回捞重训样本")
     args = parser.parse_args()
+
+    global _audit_log_path
+    _audit_log_path = args.audit_log
+    if _audit_log_path:
+        print(f"Audit log → {_audit_log_path}")
 
     print(f"Loading model: {args.checkpoint}")
     _init_model(args.checkpoint, args.tool_dir)
@@ -1000,6 +1112,7 @@ def main():
     print(f"  GET  /health               (健康检查)")
 
     server = HTTPServer((args.host, args.port), WeiyanHandler)
+    server.tool_dir = args.tool_dir  # 挂到 server 上，handler 里 self.server.tool_dir 可取
     try:
         server.serve_forever()
     except KeyboardInterrupt:
