@@ -31,6 +31,7 @@ SEARCH_CODE_DEPRIORITIZED_PATHS = (
     "scripts/inspect_tool_start_logits.py",
     "scripts/tool_call_samples",
     "docs/tool_call_samples",
+    "datasets/tool_call_samples",
 )
 
 

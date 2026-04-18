@@ -10,6 +10,7 @@
 """
 import json
 import random
+from pathlib import Path
 
 random.seed(42)
 
@@ -386,7 +387,8 @@ def generate_all():
 
 if __name__ == "__main__":
     samples = generate_all()
-    out_path = "docs/tool_call_samples_v3.jsonl"
+    out_path = "datasets/tool_call_samples/tool_call_samples_v3.jsonl"
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         for s in samples:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")

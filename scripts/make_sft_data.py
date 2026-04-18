@@ -124,7 +124,7 @@ def main():
     parser.add_argument("--claude", type=str, default="~/Desktop/claude_sft_v4_clean.jsonl", help="Claude SFT 数据路径")
     parser.add_argument("--identity", type=str, default="~/Desktop/identity_samples.jsonl", help="身份样本路径")
     parser.add_argument("--negative-identity", type=str, default="~/Desktop/negative_identity_samples.jsonl", help="否定身份样本路径")
-    parser.add_argument("--tool-call", type=str, default="docs/tool_call_samples_repo.jsonl", help="工具调用样本路径")
+    parser.add_argument("--tool-call", type=str, default="datasets/tool_call_samples/tool_call_samples_repo.jsonl", help="工具调用样本路径")
     parser.add_argument("--tool-call-upsample", type=int, default=10, help="工具调用样本过采样倍数")
     parser.add_argument("--skip-tool-call-validation", action="store_true", help="跳过工具调用样本验真")
     parser.add_argument("--rejection", type=str, default="~/Desktop/rejection_samples_clean.jsonl", help="拒绝样本路径")

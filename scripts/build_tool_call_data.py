@@ -138,7 +138,7 @@ def build_sample(prompt: str, tool_name: str, params: dict, repo_root: Path) -> 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="基于当前仓库实况构建工具调用样本")
     parser.add_argument("--repo-root", default=str(ROOT), help="仓库根目录")
-    parser.add_argument("--out", default="docs/tool_call_samples_repo.jsonl", help="输出 JSONL 路径")
+    parser.add_argument("--out", default="datasets/tool_call_samples/tool_call_samples_repo.jsonl", help="输出 JSONL 路径")
     return parser.parse_args()
 
 

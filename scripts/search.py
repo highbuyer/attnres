@@ -25,8 +25,11 @@ from pathlib import Path
 
 PYTHON = sys.executable
 TRAIN_PY = str(Path(__file__).parent / "train.py")
-RESULTS_CSV = Path("search_results.csv")
-BEST_JSON = Path("search_best.json")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SEARCH_DIR = REPO_ROOT / "runs" / "search"
+SEARCH_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_CSV = SEARCH_DIR / "search_results.csv"
+BEST_JSON = SEARCH_DIR / "search_best.json"
 STRIP_VARS = ["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "all_proxy"]
 
 CLAUDE_URL = os.environ.get("CLAUDE_URL", "http://127.0.0.1:3010/v1")

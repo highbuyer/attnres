@@ -14,6 +14,9 @@ def _candidate_paths(path_str: str) -> list[Path]:
         candidates.append(Path.cwd() / path)
         candidates.append(REPO_ROOT / path)
         candidates.append(REPO_ROOT / "checkpoints" / path.name)
+        candidates.append(REPO_ROOT / "checkpoints" / "archive" / path.name)
+        candidates.append(REPO_ROOT / "datasets" / "sft_archive" / path.name)
+        candidates.append(REPO_ROOT / "datasets" / "tool_call_samples" / path.name)
 
     unique: list[Path] = []
     seen: set[Path] = set()
@@ -39,6 +42,7 @@ def resolve_default_checkpoint(explicit_path: str | None) -> Path:
     candidates = [
         REPO_ROOT / "checkpoints" / "best_checkpoint.pt",
         REPO_ROOT / "checkpoints" / "checkpoint.pt",
+        REPO_ROOT / "checkpoints" / "archive" / "best_checkpoint.pt",
         REPO_ROOT / "best_checkpoint.pt",
         REPO_ROOT / "checkpoint.pt",
         Path.cwd() / "best_checkpoint.pt",
@@ -66,6 +70,10 @@ def resolve_sft_data_path(explicit_path: str | None) -> Path:
         return resolve_existing_path(env_path, label="SFT data")
 
     candidates = [
+        REPO_ROOT / "sft_tool_summary_v5.jsonl",
+        REPO_ROOT / "sft_tool_summary_v5_think.jsonl",
+        REPO_ROOT / "datasets" / "sft_archive" / "sft_mixed_v8.jsonl",
+        REPO_ROOT / "datasets" / "sft_archive" / "sft_mixed_v7.jsonl",
         REPO_ROOT / "sft_mixed_v8.jsonl",
         REPO_ROOT / "sft_mixed_v7.jsonl",
         Path.cwd() / "sft_mixed_v8.jsonl",

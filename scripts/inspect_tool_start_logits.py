@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="检查模型首 token 对 <|tool_call_start|> 的偏好")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--top-n", type=int, default=12)
-    parser.add_argument("--out", default="inspect_tool_start_logits.json")
+    parser.add_argument("--out", default="runs/inspect/inspect_tool_start_logits.json")
     return parser.parse_args()
 
 
@@ -111,6 +111,7 @@ def main() -> None:
         "results": rows,
     }
     out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"结果已保存: {out_path}")
 

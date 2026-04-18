@@ -305,7 +305,8 @@ def main():
         "config": {"n_layer": config.n_layer, "n_embd": config.n_embd},
         "results": results,
     }
-    out_path = f"eval_results_{ckpt_name}.json"
+    out_path = f"runs/evals/eval_results_{ckpt_name}.json"
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     print(f"结果已保存: {out_path}")

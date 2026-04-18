@@ -10,7 +10,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="构建 tool-policy-only SFT 数据")
     parser.add_argument(
         "--input",
-        default="docs/tool_call_samples_repo.jsonl",
+        default="datasets/tool_call_samples/tool_call_samples_repo.jsonl",
         help="输入工具样本 JSONL",
     )
     parser.add_argument(
