@@ -63,6 +63,39 @@ def should_ban_tool(prompt: str) -> bool:
     return any(p.search(prompt) for p in _BAN_TOOL_PATTERNS)
 
 
+# w9 (2026-04-19): 对"literal list + 明确计算操作"这类 query 走确定性 compute
+# 路径而非 model。v8 audit 里 cd_04 "列表 [3,1,4,1,5,9] 排序后是什么？" 是唯一
+# 剩下的 e2e_stuck（wiki 本质答不了计算题，model 也不会算），但计算结果本身
+# 是 deterministic 的。先落 sort 一条；去重/求和/最大/最小/平均可按同套路扩，
+# 每条都是 "regex 匹 literal list + 动词 → Python 函数 → 格式化返回"。
+# 真正泛化要等 code_sandbox 工具，但那是 P2/P3 级工作。
+_LIST_SORT_RE = re.compile(
+    r"列表\s*\[([-\d,\s]+)\]\s*(?:从\s*(大|小|高|低)\s*到\s*(大|小|高|低)\s*)?(?:升序|降序)?\s*排序后",
+    re.IGNORECASE,
+)
+
+
+def try_compute(prompt: str) -> str | None:
+    """确定性计算规则：literal-list 排序目前是唯一一条，命中即返回格式化答案。"""
+    if not prompt:
+        return None
+    m = _LIST_SORT_RE.search(prompt)
+    if m:
+        try:
+            nums = [int(s) for s in re.findall(r"-?\d+", m.group(1))]
+        except ValueError:
+            return None
+        if not nums:
+            return None
+        # 默认升序；如果 query 写 "从大到小" / "降序"，切换
+        order_from = m.group(2)
+        descending = order_from in {"大", "高"} or "降序" in prompt
+        nums_sorted = sorted(nums, reverse=descending)
+        direction = "降序" if descending else "升序"
+        return f"{direction}排序后是 {nums_sorted}。"
+    return None
+
+
 def check_identity(prompt: str) -> str | None:
     for pattern, answer in IDENTITY_PATTERNS:
         if pattern.search(prompt):
@@ -81,4 +114,8 @@ def apply_hard_rules(prompt: str) -> str | None:
     identity_answer = check_identity(prompt)
     if identity_answer:
         return identity_answer
-    return check_safety(prompt)
+    safety_answer = check_safety(prompt)
+    if safety_answer:
+        return safety_answer
+    # w9: literal 计算题走确定性 compute，跳过 model
+    return try_compute(prompt)
