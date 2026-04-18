@@ -108,6 +108,50 @@ class IsUnknownAnswerTest(unittest.TestCase):
         self.assertFalse(is_unknown_answer("水的化学式是 H₂O。"))
         self.assertFalse(is_unknown_answer("地球绕太阳转一圈约 365.25 天。"))
 
+    def test_w7a_new_templates_match(self) -> None:
+        # w6 smoke test 在 weiyan-api 上看到的实际漏掉的"不会答"模板，
+        # 都应触发 fallback。
+        self.assertTrue(
+            is_unknown_answer("对不起，我无法确认这个信息的准确性，建议你通过其他渠道核实。"),
+            "对不起 + 无法确认 + 建议你…核实 应触发 fallback",
+        )
+        self.assertTrue(
+            is_unknown_answer("这超出了我的知识范围，建议咨询专业人士或查阅权威资料。"),
+            "超出知识范围 应触发 fallback",
+        )
+        self.assertTrue(
+            is_unknown_answer("不好意思，这个问题我了解有限，暂时没法给你准确答案。"),
+            "不好意思 + 了解有限 应触发 fallback",
+        )
+        self.assertTrue(
+            is_unknown_answer("这些信息我并不太确定，建议你查证一下。"),
+            "不太确定…信息 + 建议你查证 应触发 fallback",
+        )
+
+    def test_w7a_safety_refuse_not_matched(self) -> None:
+        # 扩大模板后仍不能吃掉安全拒绝——"无法提供这类信息"语义与"不会答"
+        # 是两件事，fallback 去 wiki 查"制造炸弹"明显是错的。
+        self.assertFalse(
+            is_unknown_answer("抱歉，我无法提供这类信息。如果你有技术方面的问题，我很乐意帮忙。"),
+            "安全拒绝的'无法提供这类信息'不能触发 fallback",
+        )
+        self.assertFalse(
+            is_unknown_answer("这类请求我无法处理，请换一个话题。"),
+            "安全拒绝的'无法处理'不能触发 fallback",
+        )
+
+    def test_w7a_declarative_suggestion_not_matched(self) -> None:
+        # "根据 PEP-8，建议咨询团队约定"是陈述性建议，不是自我拒答；
+        # 新正则要求"建议/请"后必须带人称代词才算拒答语气。
+        self.assertFalse(
+            is_unknown_answer("根据 PEP-8，建议咨询团队约定。"),
+            "陈述性建议（无人称代词）不应触发 fallback",
+        )
+        self.assertFalse(
+            is_unknown_answer("查询到 3 条结果：foo.py, bar.py, baz.py。"),
+            "工具返回'查询到...'不应触发 fallback",
+        )
+
 
 class CandidateTitlesTest(unittest.TestCase):
     def test_titles_include_english_tokens(self) -> None:
