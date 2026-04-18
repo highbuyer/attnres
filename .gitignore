@@ -59,3 +59,6 @@ scripts/eval_results_*.json
 src/__pycache__/
 tests/__pycache__/
 src/run.log
+
+# weiyan-api runtime state
+.weiyan-session.json
