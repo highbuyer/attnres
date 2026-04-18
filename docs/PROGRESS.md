@@ -77,8 +77,18 @@
 
 - 主线从 v2_best 滚动训练到 v5_best（step 1500, val_bpt=1.23）
 - 新增 `weiyan-api`：HTTP 服务，OpenAI / Anthropic / /ask 三种入口 + session memory + 审计日志
-- 长 prompt bug 浮现：超过 2048 直接返回空 text（→ P0 待修）
+- 长 prompt bug 浮现：超过 2048 直接返回空 text（→ P0 已修，见 `docs/ARCH_ROADMAP.md`）
 - 下一轮 SFT 数据已备：`sft_tool_summary_v5_think.jsonl`（trace 增强 7126 条）
+
+### Phase 7: P0 架构债 + 自省闭环（2026-04-18）
+
+- **P0 ✅**：推理端 NTK 外推 2048→8192，短 prompt tool-format 8/8→8/8。详见 `docs/ARCH_ROADMAP.md`。
+- **w1 自省闭环 ✅**：`scripts/self_audit.py` 对 64 条 BENCH+repo prompt 自动打 5 类失败标签。
+  - v5_best 基线：`tool_false_fire=7 (10.9%)`、`over_refusal=3 (4.7%)`，零 degenerate/safety_miss/tool_missing。
+  - 失败集中在"世界性知识题"（化学式/物理常数/SQL/列表排序）——模型不自信时错误调 search_code。
+  - 快照：`docs/WEAKNESSES_v1.md`。
+- **w1 定向补数据 ✅**：`datasets/tool_call_samples/patch_w1.jsonl`（30 条直答样本，think=0）。
+- **下一步正在跑**：mixed SFT → `sft_think_v1` → 训练后再跑一次 self_audit 对比，目标 tool_false_fire ≤ 2。
 
 ## Runtime 修复清单
 
