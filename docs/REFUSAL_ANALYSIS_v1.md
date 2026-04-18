@@ -112,18 +112,18 @@ T4: 这个问题我不太确定答案，建议查阅相关资料获取准确信�
 **本轮可做**：
 1. ✅ Refusal 分析完成（本文档）
 2. ✅ 审查 `sft_tool_summary_v5.jsonl`，定位 128 条错标（scripts/audit_refusal_templates.py → runs/refusal_templates_audit.jsonl）
-3. → 写 `data/anti_refusal_seed.jsonl` 草稿（50-100 条样本 spec）
+3. ✅ DeepSeek V3 批量改写 101 条 benign 错标（scripts/rewrite_refusal_data.py → runs/refusal_rewrites.jsonl，70 秒跑完，0 错误）
+4. ✅ 10 条人工 spot check 全部通过（星期推理、数字分类、Python docstring、5 位科学家含屠呦呦、MNIST 异常值分析均专业准确）
+5. ✅ 应用改写生成 clean 数据集（scripts/apply_refusal_rewrites.py → `data/sft_tool_summary_v5_clean.jsonl`，7126 条，拒答模板命中从 128 → 27，0 条 benign 残留）
 
 **后续（下周）**：
-4. 执行路径 B：
-   - 删除或替换 101 条错标（可用外部大模型批量生成正确答案，人工 spot check 10%）
-   - 扩补 300-500 条 anti-refusal 正例，覆盖 over_refusal 6 条原型 prompt 的同类变体
-   - 合并到 13k → 目标 ≥30k SFT 总集
-5. 重训 v5_pruned + 新数据，跑 self_audit，目标 over_refusal 从 6/64 降到 ≤2/64
+6. 扩 300-500 条 anti-refusal 正例（新增，非修改），覆盖 over_refusal 6 条原型 prompt 的同类变体
+7. 重训 v5_pruned + clean 数据集，跑 self_audit，目标 over_refusal 6/64 → ≤2/64
 
 **不做**：
 - ❌ 单独 50 条 anti-refusal patch-SFT（memory 禁忌：三连败）
 - ❌ 推理层 hard rule 扩大化（workaround 而非根治）
+- ❌ 处理 27 条 non-benign（heuristic 漏判，但动它们需人工审核，风险大于收益）
 
 ## 最重要的单条发现
 
