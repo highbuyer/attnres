@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from research_fallback import (  # noqa: E402
     _core_tokens,
     _is_related_loose,
+    _subject_segment,
+    _subject_title_match,
     candidate_titles,
     is_related,
     is_unknown_answer,
@@ -158,6 +160,54 @@ class CandidateTitlesTest(unittest.TestCase):
         cands = candidate_titles("Python 和 Java 哪个更适合初学者？")
         self.assertIn("Python", cands)
         self.assertIn("Java", cands)
+
+    def test_w7c_short_subject_prepended(self) -> None:
+        # w7c: 候选排序把短主题词前置，让 wiki 能及早命中 "北京"/"山峰" 这类
+        # 主题词条——之前 "北京" 排在第 6 位超出 wiki_lookup 的 cands[:6] 阈值。
+        cands = candidate_titles("北京有什么著名景点？")
+        # 前两位应为主题词段，不是 cleaned 整串
+        self.assertIn("北京", cands[:2])
+        self.assertIn("著名景点", cands[:3])
+
+        cands2 = candidate_titles("世界上最高的山峰是哪座？")
+        # "世界上最高" + "山峰" 都是主题词段
+        self.assertIn("世界上最高", cands2[:3])
+        self.assertIn("山峰", cands2[:3])
+
+
+class SubjectTitleMatchTest(unittest.TestCase):
+    """w7c 的二级放行规则：title 是 query 主题词的短真扩展 → 放行。"""
+
+    def test_subject_segment_picks_first_chinese_chunk(self) -> None:
+        self.assertEqual(_subject_segment("北京有什么著名景点？"), "北京")
+        self.assertEqual(_subject_segment("世界上最高的山峰是哪座？"), "世界上最高")
+        self.assertEqual(_subject_segment("列表 [3,1,4,1,5,9] 排序后是什么？"), "列表")
+
+    def test_match_allows_beijing_to_beijingshi(self) -> None:
+        # 救 mt_01：wiki 对 "北京" 返回 "北京市"，len 3 > subject 2 且 ≤ 4
+        self.assertTrue(_subject_title_match("北京有什么著名景点？", "北京市"))
+
+    def test_match_rejects_title_equals_subject(self) -> None:
+        # cd_04 防回归：wiki "列表" 词条与 "列表 [..] 排序后" 的意图不同；
+        # title == subject 不放行
+        self.assertFalse(_subject_title_match("列表 [3,1,4,1,5,9] 排序后是什么？", "列表"))
+
+    def test_match_rejects_long_title(self) -> None:
+        # w5 防回归：title 太长不算主题词变体
+        self.assertFalse(_subject_title_match("北京有什么著名景点？", "北京有轨电车"))
+        self.assertFalse(_subject_title_match("北京有什么著名景点？", "北京有轨电车系统"))
+
+    def test_match_rejects_different_subject(self) -> None:
+        self.assertFalse(_subject_title_match("北京有什么著名景点？", "上海市"))
+
+    def test_is_related_uses_subject_match_as_second_pass(self) -> None:
+        # 严格核心 "著名景点" 不在 extract；但主题词 "北京" 命中 "北京市" → 放行
+        ok = is_related(
+            "北京有什么著名景点？",
+            "北京市",
+            "北京，通称北京市，简称京，是中华人民共和国的首都、直辖市、国家中心城市。",
+        )
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":

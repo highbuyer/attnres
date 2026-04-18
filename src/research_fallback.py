@@ -98,15 +98,34 @@ def build_url_opener(proxies: dict | None = None) -> urllib.request.OpenerDirect
 
 
 def candidate_titles(query: str) -> list[str]:
-    """给出一组维基检索候选，按命中优先级排序。"""
+    """给出一组维基检索候选，按命中优先级排序。
+
+    w7c 排序策略：先试"短主题词"（剥 stopword 后 2-6 字中文段如 "北京"、
+    "山峰"），wiki 对这种常返回直接匹配的词条（"北京" → "北京市"）；再试
+    cleaned 整串、findall 长段、n-gram 滑窗作为兜底。原排序把 cleaned 放
+    最前导致大量 query 浪费在 wiki 返回 `[]` 的长串上。
+    """
     c: list[str] = []
+    # 1) 短主题词（w7c 新增，提升 wiki 对 "北京"/"山峰" 这类主题查询的命中率）
+    spaced = "".join(ch if ch not in RESEARCH_STOPWORDS else " " for ch in query)
+    spaced = re.sub(r"[?？!！。.,，;；:：]+", " ", spaced)
+    for seg in spaced.split():
+        if not (2 <= len(seg) <= 6):
+            continue
+        if not all("\u4e00" <= ch <= "\u9fff" for ch in seg):
+            continue
+        if seg not in c:
+            c.append(seg)
+    # 2) cleaned 整串（旧一号候选，降到第二）
     cleaned = "".join(ch for ch in query if ch not in RESEARCH_STOPWORDS)
     cleaned = re.sub(r"[?？!！。.,，;；:：\s]+", " ", cleaned).strip()
     if cleaned and cleaned not in c:
         c.append(cleaned)
+    # 3) findall 直接抽
     for m in re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z][A-Za-z0-9]{2,}", query):
         if m not in c:
             c.append(m)
+    # 4) 长串 n-gram 滑窗兜底
     for block in re.findall(r"[\u4e00-\u9fff]{5,}", query):
         for n in (4, 3, 2):
             for i in range(len(block) - n + 1):
@@ -133,6 +152,38 @@ def _core_tokens(query: str) -> list[str]:
     return tokens
 
 
+def _subject_segment(query: str) -> str | None:
+    """query 剥 stopword 后第一个 ≥2 字连续中文段，作为"主题词"。
+
+    用于 is_related 的二级放行：wiki title 若是主题词的短变体（例 '北京' → '北京市'），
+    即使核心串（'著名景点'）不在 title/extract 里也认为相关。与 _core_tokens（≥3 字）
+    并存——_core_tokens 负责严格命中，_subject_segment 负责承认"wiki 对主题的短变体
+    回答"也是有效答案。
+    """
+    spaced = "".join(ch if ch not in RESEARCH_STOPWORDS else " " for ch in query)
+    spaced = re.sub(r"[?？!！。.,，;；:：]+", " ", spaced)
+    for seg in spaced.split():
+        if len(seg) >= 2 and all("\u4e00" <= ch <= "\u9fff" for ch in seg):
+            return seg
+    return None
+
+
+def _subject_title_match(query: str, title: str) -> bool:
+    """title 是 query 主题词的**短真扩展**？要求 len(subject) < len(title) ≤
+    subject + 2，即 title 必须在 subject 基础上加 1-2 个字符（典型：'北京'→
+    '北京市'）。title == subject 本身不放行——否则 query '列表 [..] 排序后'
+    会把 wiki '列表' 词条（数据结构定义）错误判为相关，虽然 subject 对但
+    query 本意不是查主题本身。
+    """
+    subject = _subject_segment(query)
+    if subject is None:
+        return False
+    return (
+        title.startswith(subject)
+        and len(subject) < len(title) <= len(subject) + 2
+    )
+
+
 def _is_related_loose(query: str, text: str) -> bool:
     """旧版 is_related：query 与 text 共享 ≥1 个 2-gram（中文）或单字（中文长度=1）。"""
     q_norm = "".join(ch for ch in query if ch not in RESEARCH_STOPWORDS)
@@ -150,6 +201,11 @@ def is_related(query: str, title: str, text: str) -> bool:
     """判定 wiki 命中是否与 query 相关。收紧版（w6）：要求 query 的核心串
     至少一个完整出现在 title 或 text 开头的 300 字内；无核心串则回退 loose。
 
+    w7c 二级放行：严格核心未命中时，若 title 是 query 主题词的短变体（例
+    "北京"→"北京市"），仍视为相关——wiki 对短查询常返回主体词条（"北京"→
+    "北京市"），其 extract 介绍的就是主题本身，对用户而言比"我不会答"
+    更有价值。长度 ≤ subject+2 的上限保 w5 误匹不复活。
+
     修正的误匹（w5 发现）：
     - "世界上最高的山峰" → "世界上最糟糕的人" ❌ loose 通过（共享"世界"）/ ✓ strict 过滤
     - "列表 [..] 排序后" → "列表（表格）" ❌ loose 通过（共享"列表"）/ ✓ strict 过滤
@@ -157,6 +213,8 @@ def is_related(query: str, title: str, text: str) -> bool:
     保留的擦边（生产可接受）：
     - "水的化学式" → "化学式"（通用定义，非 H₂O，但确实相关）
     - "Python 和 Java 哪个更适合" → "Python"（只覆盖半边，不算错）
+    w7c 新放行：
+    - "北京有什么著名景点" → "北京市"（主题词 "北京" 的短变体，len 3 ≤ 4 允许）
     """
     if not query or not title:
         return False
@@ -165,7 +223,10 @@ def is_related(query: str, title: str, text: str) -> bool:
         # query 太短，退 loose 避免过度过滤
         return _is_related_loose(query, title + " " + text)
     haystack = title + " " + (text[:300] if text else "")
-    return any(core in haystack for core in cores)
+    if any(core in haystack for core in cores):
+        return True
+    # w7c: 严格核心未命中时，检查 title 是否是 query 主题词的短变体
+    return _subject_title_match(query, title)
 
 
 def wiki_lookup(
@@ -173,16 +234,23 @@ def wiki_lookup(
     opener: urllib.request.OpenerDirector | None = None,
     timeout: int = HTTP_TIMEOUT,
 ) -> tuple[str | None, str]:
-    """查维基百科中文。返回 (摘要, 诊断原因)；找不到或无关时摘要为 None。"""
+    """查维基百科中文。返回 (摘要, 诊断原因)；找不到或无关时摘要为 None。
+
+    w7c 扩招策略：每个 candidate 取 opensearch top-3 而非 top-1，逐个过
+    is_related；试 cands[:6] 而非 [:4]。动机：同一 candidate 的 top-1 可能
+    是消歧义词条/相似但无关词条（"北京" opensearch 顺序常见 '北京市' →
+    '北京大学' → '北京首都国际机场'，top-1 不一定最对），让 is_related
+    来挑。
+    """
     if opener is None:
         opener = build_url_opener()
     cands = candidate_titles(query)
     if not cands:
         return None, "no_keywords"
     last = "unknown"
-    for cand in cands[:4]:
+    for cand in cands[:6]:
         search_url = (
-            "https://zh.wikipedia.org/w/api.php?action=opensearch&limit=1&format=json&search="
+            "https://zh.wikipedia.org/w/api.php?action=opensearch&limit=3&format=json&search="
             + urllib.parse.quote(cand)
         )
         try:
@@ -201,28 +269,28 @@ def wiki_lookup(
         if not titles:
             last = f"no_match({cand!r})"
             continue
-        real = titles[0]
-        summary_url = "https://zh.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(real)
-        try:
-            req = urllib.request.Request(summary_url, headers={"User-Agent": WIKI_UA})
-            with opener.open(req, timeout=timeout) as resp:
-                summary = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            last = f"summary_http_{exc.code}({real!r})"
-            continue
-        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            return None, f"net_unreachable({exc.__class__.__name__})"
-        except Exception as exc:
-            last = f"summary_err({exc.__class__.__name__})"
-            continue
-        extract = (summary.get("extract") or "").strip()
-        if not extract:
-            last = f"no_extract({real!r})"
-            continue
-        if not is_related(query, real, extract):
-            last = f"irrelevant({cand!r}->{real!r})"
-            continue
-        return f"维基百科·{real}：{extract}", "ok"
+        for real in titles[:3]:
+            summary_url = "https://zh.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(real)
+            try:
+                req = urllib.request.Request(summary_url, headers={"User-Agent": WIKI_UA})
+                with opener.open(req, timeout=timeout) as resp:
+                    summary = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                last = f"summary_http_{exc.code}({real!r})"
+                continue
+            except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+                return None, f"net_unreachable({exc.__class__.__name__})"
+            except Exception as exc:
+                last = f"summary_err({exc.__class__.__name__})"
+                continue
+            extract = (summary.get("extract") or "").strip()
+            if not extract:
+                last = f"no_extract({real!r})"
+                continue
+            if not is_related(query, real, extract):
+                last = f"irrelevant({cand!r}->{real!r})"
+                continue
+            return f"维基百科·{real}：{extract}", "ok"
     return None, last
 
 
