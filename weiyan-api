@@ -22,13 +22,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -37,12 +33,18 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from research_fallback import (  # noqa: E402
+    FILE_REF_RE,
+    build_url_opener,
+    is_unknown_answer,
+    research_fallback,
+)
+
 
 _lock = Lock()
 MAX_GENERATE_TOKENS = 1024
 HEARTBEAT_EVERY_TOKENS = 128
 MAX_DECODE_SECONDS = 20
-RESEARCH_HTTP_TIMEOUT = 5  # 秒；联网查证单次请求上限
 # P0: 推理端上下文上限。训练 sequence_len=2048，通过 NTK-aware RoPE 外推到 8192。
 # 与 src/infer.py 的 INFER_MAX_CONTEXT 保持一致。
 INFER_MAX_CONTEXT = 8192
@@ -144,235 +146,12 @@ def _audit_log(req_id: str, path: str, prompt: str, outcome: str, answer: str, e
         pass  # 审计失败不阻塞业务
 
 
-# SFT 训练过的"拒答"模板，命中则走 _research_fallback
-_UNKNOWN_ANSWER_RE = re.compile(
-    r"(抱歉[，,].{0,40}(了解有限|无法.{0,10}回答|不会这个|不懂)"
-    r"|(不确定|不太确定).{0,30}(答案|回答)"
-    r"|无法.{0,8}给出.{0,8}(准确|正确).{0,8}回答"
-    r"|建议.{0,8}查阅.{0,10}资料"
-    r"|我.{0,4}不知道.{0,10}(答案|日期|时间)?)",
-    re.IGNORECASE,
-)
-
-
-def _is_unknown_answer(text: str) -> bool:
-    if not text or len(text) > 300:
-        return False
-    return bool(_UNKNOWN_ANSWER_RE.search(text))
-
-
-def _search_local_docs(query: str, tool_dir: str | None) -> str | None:
-    """在项目 docs/ 和 README 里 grep 关键词，返回前 3 条命中摘要。"""
-    if not tool_dir:
-        return None
-    terms = [t for t in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_]{2,}", query) if len(t) >= 2]
-    if not terms:
-        return None
-    try:
-        result = subprocess.run(
-            [
-                "rg",
-                "--no-heading",
-                "-n",
-                "--max-count", "3",
-                "-i",
-                "--fixed-strings",
-                "--glob", "docs/**",
-                "--glob", "README*",
-                "--glob", "*.md",
-                "-e", terms[0],
-            ]
-            + [arg for term in terms[1:4] for arg in ("-e", term)],
-            cwd=tool_dir,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    # 过滤纯命令行/代码片段/训练数据：以 `uv run`、`python `、`$`、`#`、缩进代码、JSON 开头等
-    def _is_prose(line: str) -> bool:
-        # rg 输出格式: path:lineno:content
-        path_part, _, rest = line.partition(":")
-        _, _, content = rest.partition(":")
-        content = content.strip()
-        if not content:
-            return False
-        # 直接排除训练数据文件（jsonl/json 样本）
-        if path_part.endswith(".jsonl") or path_part.endswith(".json"):
-            return False
-        bad_prefixes = ("uv run", "python ", "python3 ", "bash ", "$ ", "# ", "```", ">>>", "import ", "from ", "{\"", "{'")
-        if any(content.startswith(p) for p in bad_prefixes):
-            return False
-        # 含工具协议 token 或明显 JSON 片段 → 训练数据
-        if "<|tool_" in content or '"messages":' in content or '"role":' in content:
-            return False
-        # 必须包含至少 4 个中文字符或 15 个字母字符，否则判为代码/表达式
-        chinese = sum(1 for ch in content if "\u4e00" <= ch <= "\u9fff")
-        if chinese < 4 and sum(1 for ch in content if ch.isalpha()) < 15:
-            return False
-        return True
-
-    lines = [line for line in lines if _is_prose(line)]
-    if not lines:
-        return None
-    return "\n".join(lines[:3])
-
-
-_RESEARCH_STOPWORDS = set("的是什么吗呢何为怎么怎样如何请问给我查一下能够可以会不")
-_WIKI_UA = "Mozilla/5.0 (compatible; weiyan-api/1.0; +https://zh.wikipedia.org/)"
-
-
-def _candidate_titles(query: str) -> list[str]:
-    """给出一组维基检索候选，按命中优先级排序。"""
-    c: list[str] = []
-    cleaned = "".join(ch for ch in query if ch not in _RESEARCH_STOPWORDS)
-    cleaned = re.sub(r"[？?！!。.，,；;：:\s]+", " ", cleaned).strip()
-    if cleaned and cleaned not in c:
-        c.append(cleaned)
-    # 直接抽到的词
-    direct = re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z][A-Za-z0-9]{2,}", query)
-    for m in direct:
-        if m not in c:
-            c.append(m)
-    # 对长中文串做 n-gram 滑窗（n=4,3,2），常见复合词如"光合作用化学式" → 光合作用/化学式
-    for block in re.findall(r"[\u4e00-\u9fff]{5,}", query):
-        for n in (4, 3, 2):
-            for i in range(len(block) - n + 1):
-                gram = block[i:i + n]
-                if gram in _RESEARCH_STOPWORDS or any(ch in _RESEARCH_STOPWORDS for ch in gram):
-                    continue
-                if gram not in c:
-                    c.append(gram)
-    return c
-
-
-def _is_related(query: str, text: str) -> bool:
-    """query 与 text 是否共享至少一个 2-gram（中文）或 3-gram（英文），用来排除过度泛化的词条。单字 query 只要 text 里出现过就算相关。"""
-    if not query or not text:
-        return False
-    q_norm = "".join(ch for ch in query if ch not in _RESEARCH_STOPWORDS)
-    q_norm = re.sub(r"[\s？?！!。.，,；;：:]+", "", q_norm)
-    text_norm = re.sub(r"\s+", "", text[:500])
-    if not q_norm:
-        return False
-    # 单字 query：只要 text 开头 100 字包含该字即算相关
-    if len(q_norm) == 1:
-        return q_norm in text_norm[:100]
-    grams = set()
-    for i in range(len(q_norm) - 1):
-        grams.add(q_norm[i:i + 2])
-    for g in grams:
-        if g and g in text_norm:
-            return True
-    return False
-
-
-def _extract_wiki_title(query: str) -> str:
-    cands = _candidate_titles(query)
-    return cands[0] if cands else query.strip()
-
-
-def _wiki_lookup(query: str) -> tuple[str | None, str]:
-    """查维基百科中文。返回 (摘要, 诊断原因)；找不到时摘要为 None。"""
-    candidates = _candidate_titles(query)
-    if not candidates:
-        return None, "问题里提取不出可用的检索关键词"
-
-    last_reason = "未知"
-    for cand in candidates[:4]:  # 最多试 4 个候选
-        search_url = (
-            "https://zh.wikipedia.org/w/api.php?action=opensearch&limit=1&format=json&search="
-            + urllib.parse.quote(cand)
-        )
-        try:
-            req = urllib.request.Request(search_url, headers={"User-Agent": _WIKI_UA})
-            with _URL_OPENER.open(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            last_reason = f"检索 HTTP {exc.code}（候选「{cand}」）"
-            continue
-        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            return None, f"联网不可达 ({exc.__class__.__name__}: {exc})"
-        except Exception as exc:
-            last_reason = f"维基检索异常 ({exc.__class__.__name__})"
-            continue
-        matched_titles = data[1] if isinstance(data, list) and len(data) > 1 else []
-        if not matched_titles:
-            last_reason = f"候选「{cand}」未命中词条"
-            continue
-        real_title = matched_titles[0]
-        summary_url = "https://zh.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(real_title)
-        try:
-            req = urllib.request.Request(summary_url, headers={"User-Agent": _WIKI_UA})
-            with _URL_OPENER.open(req, timeout=RESEARCH_HTTP_TIMEOUT) as resp:
-                summary = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            last_reason = f"词条页 HTTP {exc.code}（「{real_title}」）"
-            continue
-        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            return None, f"词条页请求失败 ({exc.__class__.__name__}: {exc})"
-        except Exception as exc:
-            last_reason = f"词条页解析失败 ({exc.__class__.__name__})"
-            continue
-        extract = (summary.get("extract") or "").strip()
-        if not extract:
-            last_reason = f"词条「{real_title}」无摘要"
-            continue
-        if not _is_related(query, real_title + extract):
-            last_reason = f"候选「{cand}」命中「{real_title}」但内容与问题无关，已过滤"
-            continue
-        return f"维基百科·{real_title}：{extract}", "ok"
-    return None, last_reason
-
-
-_PROJECT_SCOPE_KEYWORDS = re.compile(
-    r"(项目|仓库|代码|文件|函数|类|脚本|模块|目录|路径|配置|checkpoint|weiyan|微研|attnres|sft|infer|train|eval|tokenizer|分词|架构|流程|内容|里有什么|写了什么|里面是什么|\.(?:py|md|json|jsonl|toml|yaml|yml|txt|sh|cfg))",
-    re.IGNORECASE,
-)
-_FILE_REF_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:py|md|json|jsonl|toml|yaml|yml|txt|sh|cfg))", re.IGNORECASE)
-
-
-def _build_url_opener():
-    """显式构造支持代理的 opener。urllib 默认也读 env，但对 HTTPS + 大写变量有时失灵，这里兜底。"""
-    import os
-    proxies = {}
-    for scheme in ("http", "https"):
-        for var in (scheme + "_proxy", (scheme + "_proxy").upper()):
-            if os.environ.get(var):
-                proxies[scheme] = os.environ[var]
-                break
-    handlers = []
-    if proxies:
-        handlers.append(urllib.request.ProxyHandler(proxies))
-    return urllib.request.build_opener(*handlers)
-
-
-_URL_OPENER = _build_url_opener()
-
-
-def _research_fallback(prompt_text: str, tool_dir: str | None, req_id: str) -> str:
-    """模型拒答时：（项目类问题）本机 docs → 维基百科 → 诚实说明原因。通用知识问题跳过本机 docs。"""
-    project_scoped = bool(_PROJECT_SCOPE_KEYWORDS.search(prompt_text))
-    local_reason = "通用问题，跳过本机 docs"
-    if project_scoped:
-        local = _search_local_docs(prompt_text, tool_dir)
-        if local:
-            _debug(req_id, f"research fallback hit local {len(local)} chars")
-            return "模型没直接掌握，但在项目文档里找到相关条目：\n" + local
-        local_reason = "本机文档未命中"
-    wiki, reason = _wiki_lookup(prompt_text)
-    if wiki:
-        _debug(req_id, f"research fallback hit wiki len={len(wiki)}")
-        return "模型没直接掌握，以下摘自维基百科（请自行验证）：\n" + wiki
-    _debug(req_id, f"research fallback gave up local={local_reason} wiki={reason}")
-    return (
-        "我对这个问题没有把握。尝试过的查证：\n"
-        f"- 本机项目文档：{local_reason}\n"
-        f"- 维基百科中文：{reason}\n"
-        "如果能提供更精确的关键词或上下文，我可以再试一次。"
-    )
+# research fallback 相关（_UNKNOWN_ANSWER_RE / _wiki_lookup / _is_related /
+# _research_fallback / _FILE_REF_RE / _PROJECT_SCOPE_KEYWORDS）已抽到
+# src/research_fallback.py，参见 w6。此处只构造一次 proxy-aware opener，
+# 注入给 research_fallback。weiyan-api 启动时环境变量干净，所以不需要
+# 像 self_audit 那样提前快照（self_audit 被 train.py 的 fa3 backend 清 env）。
+_URL_OPENER = build_url_opener()
 
 
 def _debug(req_id: str, message: str):
@@ -728,7 +507,7 @@ def _init_model(checkpoint: str, tool_dir: str):
 
         # 文件内容直读短路：匹配到形如 FOO.md / foo.py 的引用，且问句带 "内容/有什么/看一下/读" 意图
         # 或整句除文件名外只剩 ≤4 字符（"X.py 呢" / "X.py?" / 孤立文件名），也视为读文件请求
-        file_ref_match = _FILE_REF_RE.search(p)
+        file_ref_match = FILE_REF_RE.search(p)
         intent_phrases = ("内容", "有什么", "看一下", "看下", "读一下", "读下", "读", "讲了什么", "写了什么", "呢")
         if file_ref_match:
             rel = file_ref_match.group(1)
@@ -978,9 +757,14 @@ def _init_model(checkpoint: str, tool_dir: str):
             elif first_line:
                 result = f"我查到了相关结果，但还没来得及整理成自然语言回答。首条结果：`{first_line}`。"
 
-        if _is_unknown_answer(result):
+        if is_unknown_answer(result):
             _debug(req_id, f"unknown-answer detected, entering research fallback; orig={_preview(result)!r}")
-            result = _research_fallback(prompt_text, tool_dir, req_id)
+            result = research_fallback(
+                prompt_text,
+                tool_dir,
+                opener=_URL_OPENER,
+                debug=lambda m: _debug(req_id, m),
+            )
 
         _debug(req_id, f"generate done output_len={len(result)} output={_preview(result)!r}")
         return result
@@ -1064,7 +848,7 @@ class WeiyanHandler(BaseHTTPRequestHandler):
         # Session + audit：记录本轮，方便跨请求引用与后续数据回捞
         try:
             tool_dir_for_session = getattr(self.server, "tool_dir", None)
-            file_match = _FILE_REF_RE.search(prompt_text) if prompt_text else None
+            file_match = FILE_REF_RE.search(prompt_text) if prompt_text else None
             _session_record(
                 tool_dir_for_session,
                 query=prompt_text,
