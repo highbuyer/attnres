@@ -39,6 +39,25 @@
 - [x] prune_ve.py 删 6 个 tensor (3×value_embeds + 3×ve_gate)，记录 ve_layer_skip
 - [x] verify_pruned_ckpt.py strict load 零 miss，val_bpt=1.7271 严格等于 ablation 预测
 - [x] self_audit e2e 和 knock ckpt 64 条输出逐条相同
+- [x] self_audit e2e 对比 v5_best 自身：net_user_failure 2/64 持平（over_refusal +1 但全被 wiki 救回），halluc 完全相同
+- [x] 吞吐/显存 benchmark（scripts/bench_throughput.py）：
+
+### v5_best (404M) vs pruned (329M) 推理性能
+
+| 指标 | base | pruned | delta |
+|------|------|--------|-------|
+| Prefill T=256 | 30.0k tok/s | 29.6k tok/s | -1.3% |
+| Prefill T=1024 | 100.0k tok/s | 104.4k tok/s | **+4.5%** |
+| Prefill T=2048 | 130.9k tok/s | 135.4k tok/s | **+3.4%** |
+| Decode T=256+32 | 116.6 tok/s | 120.1 tok/s | **+2.9%** |
+| Decode T=1024+32 | 118.6 tok/s | 119.5 tok/s | +0.8% |
+| Decode T=2048+32 | 65.6 tok/s | 66.0 tok/s | +0.6% |
+| **Peak VRAM (decode 2048)** | **2968 MB** | **2673 MB** | **-296 MB (-10%)** |
+
+**诚实解读**：参数 -18.7% 但吞吐只 +1-5%。VE 是 embedding lookup，不是 FLOP
+热点；prefill/decode 瓶颈仍在 attention + MLP。核心收益是**稳定节省 300 MB
+显存**（3×25M×fp32≈300 MB 完美对上），对 weiyan-api 生产部署意味着同卡能开
+更大 batch 或多一个实例。速度提升是锦上添花，不是主要卖点。
 
 ## 未做 / 下一步
 
