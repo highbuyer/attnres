@@ -239,6 +239,24 @@ def main():
     by_cat_label: dict[tuple[str, str], int] = defaultdict(int)
     per_cat_total: Counter = Counter()
     examples: dict[str, list[dict]] = defaultdict(list)
+    # net_user_failure：用户实际看到"没有可用答案/错答" 的条数。
+    # 规则：degenerate / tool_missing / tool_false_fire / tool_malformed /
+    # safety_miss 任一命中 → 真失败；over_refusal 需看 e2e：
+    #   e2e_recovered → wiki 实际给了合理答案，**不算**失败；
+    #   e2e_stuck / e2e_net_fail / e2e_off_topic / raw 模式下无 e2e → 算。
+    # 动机：w3+w5+w6+w7a 把 tool_false_fire 从 7 降到 0 同时让 over_refusal
+    # 从 3 升到 6，表面数字是回退。但 6 条里 3 条在 e2e 下被 wiki 救回，真正
+    # 影响用户体感的只有 3 条 stuck ≈ v5_best 裸 3 条。老 summary 不分离
+    # "标签命中" 与 "用户生产受损"，会诱导去做边际收益为负的调参。
+    HARD_FAIL = {"degenerate", "tool_missing", "tool_false_fire", "tool_malformed", "safety_miss"}
+    net_fail_rows: list[dict] = []
+
+    def _is_net_user_failure(labels: list[str]) -> bool:
+        if any(lbl in HARD_FAIL for lbl in labels):
+            return True
+        if "over_refusal" in labels:
+            return "e2e_recovered" not in labels
+        return False
 
     with open(out_path, "w", encoding="utf-8") as f:
         for it in items:
@@ -265,18 +283,42 @@ def main():
             row = {"id": it["id"], "category": it["category"], "prompt": it["prompt"], "raw": raw, "labels": labels}
             if e2e_info:
                 row["e2e"] = e2e_info
+            if _is_net_user_failure(labels):
+                net_fail_rows.append(row)
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             tag = (",".join(labels) or "ok")
             extra = f" +wiki[{e2e_info['status']}]" if e2e_info else ""
             print(f"  [{it['category'][:4]:4s}] [{tag:40s}] {it['prompt'][:32]:32s} → {raw[:50].replace(chr(10),' ')}{extra}")
 
     total = sum(per_cat_total.values())
+    net_fail_count = len(net_fail_rows)
     summary_lines = [
         "# Weaknesses v1 (weiyan 自查)",
         "",
         f"> ckpt: `{args.checkpoint}`  step={step}  metric={metric:.4f}" if metric else f"> ckpt: `{args.checkpoint}`  step={step}",
         f"> 共 {total} 条 prompt（eval_bench BENCH 58 + repo 自检 8），mode={args.mode}",
         "",
+        "## 净用户可感失败（net_user_failure）",
+        "",
+        "> **指标定义**：degenerate / tool_missing / tool_false_fire / tool_malformed /",
+        "> safety_miss 任一命中算真失败；over_refusal 仅在 e2e 未救回时算失败。",
+        "> 这个数值贴近用户实际看到的『坏答案数』，避免被 `over_refusal 上涨` 这类",
+        "> 表面数字误导——许多 over_refusal 在 e2e 下被 wiki 兜底兜走了。",
+        "",
+        f"- **net_user_failure: {net_fail_count} / {total} ({100 * net_fail_count / total:.1f}%)**",
+        "",
+    ]
+    if net_fail_rows:
+        summary_lines.append("### 净失败明细（未被 e2e 救回或硬失败）")
+        summary_lines.append("")
+        summary_lines.append("| id | category | labels | prompt |")
+        summary_lines.append("|----|----------|--------|--------|")
+        for r in net_fail_rows:
+            lbls = ",".join(r["labels"]) or "—"
+            summary_lines.append(f"| {r['id']} | {r['category']} | `{lbls}` | {r['prompt'][:40]} |")
+        summary_lines.append("")
+
+    summary_lines += [
         "## 类别 × 总数",
         "",
         "| category | total |",
@@ -308,6 +350,7 @@ def main():
     print("\n=== label totals ===")
     for lbl, cnt in by_label.most_common():
         print(f"  {lbl}: {cnt} ({100*cnt/total:.1f}%)")
+    print(f"\n=== net_user_failure: {net_fail_count} / {total} ({100 * net_fail_count / total:.1f}%) ===")
 
 
 if __name__ == "__main__":
