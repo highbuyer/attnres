@@ -131,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-context", type=int, default=INFER_MAX_CONTEXT, help=f"Effective context length at inference (default {INFER_MAX_CONTEXT}, ckpt trained at 2048; uses NTK-aware RoPE extension)")
     parser.add_argument("--tool-dir", type=str, default=".", help="工具调用的工作目录（search_code/read_file 在此目录下执行）")
     parser.add_argument("--no-tools", action="store_true", help="禁用工具调用执行（模型仍可能输出工具调用格式，但不会执行）")
+    parser.add_argument("--no-kv-cache", action="store_true", help="关闭 KV cache，回退到每 token 重算全前缀（调试用）")
     return parser.parse_args()
 
 
@@ -292,6 +293,25 @@ def main() -> None:
         generated_ids: list[int] = []
         last_tool_result: str | None = None
 
+        # KV cache 状态：past_kvs 是每层的 (k, v) 列表，past_len 是已覆盖的序列长度。
+        # --no-kv-cache 走旧路径（每次 forward 重传 x[:, -max_context:]）。
+        use_cache = not args.no_kv_cache
+        past_kvs: list | None = None
+        past_len = 0
+
+        def _forward_on(new_ids_tensor):
+            """喂 new_ids_tensor（shape [1, T_new]）到 model，更新 past_kvs/past_len，
+            返回最后一个 position 的 logits（shape [1, vocab_size]）。"""
+            nonlocal past_kvs, past_len
+            if use_cache:
+                # KV cache 路径：只喂 new tokens + past_kvs
+                out, past_kvs = model(new_ids_tensor, past_kvs=past_kvs, position_offset=past_len, use_cache=True)
+                past_len += new_ids_tensor.size(1)
+                return out[:, -1, :]
+            # 回退：no-cache 每次重算（和旧行为等价）
+            out = model(x[:, -max_context:])
+            return out[:, -1, :]
+
         # 工具调用 token IDs
         tool_call_end_id = enc.encode_single_token('<|tool_call_end|>') if '<|tool_call_end|>' in SPECIAL_TOKENS else None
         tool_call_start_id = enc.encode_single_token('<|tool_call_start|>') if '<|tool_call_start|>' in SPECIAL_TOKENS else None
@@ -303,13 +323,15 @@ def main() -> None:
         ban_tool = should_ban_tool(prompt) and tool_call_start_id is not None and not args.no_tools
 
         for _tool_round in range(max_tool_rounds + 1):
+            # prefill 尚未 forward 过的 tokens（第一轮是整个 prompt；后续轮次是 tool_result 注入部分）
+            if _tool_round == 0:
+                next_to_feed = x
             # 生成直到遇到 stop token
             round_ids: list[int] = []
             round_flushed = False
             for _ in range(args.max_tokens):
                 with torch.no_grad(), autocast_ctx:
-                    logits = model(x[:, -max_context:])
-                    logits = logits[:, -1, :]
+                    logits = _forward_on(next_to_feed)
 
                 # w3: 若 prompt 命中 should_ban_tool 且还未开始生成任何 tool_call，
                 # 强制禁掉 <|tool_call_start|> token；已经开始的 tool_call 不干预（保留 partial 兼容）
@@ -332,6 +354,7 @@ def main() -> None:
                     next_id = torch.multinomial(probs, num_samples=1)
 
                 token_id = int(next_id.item())
+                next_to_feed = next_id  # 下一步只喂这 1 个新 token（KV cache 路径）
 
                 # 检查是否是 tool_call_end（触发工具执行）
                 if tool_call_end_id and token_id == tool_call_end_id and not args.no_tools:
@@ -378,6 +401,7 @@ def main() -> None:
                 result_tensor = torch.tensor([result_ids], dtype=torch.long, device=device)
                 x = torch.cat([x, result_tensor], dim=1)
                 last_tool_result = result
+                next_to_feed = result_tensor  # 下一轮 prefill 这段新注入的 tokens
                 continue  # 继续生成（模型会输出总结）
             else:
                 # 没有工具调用，正常结束

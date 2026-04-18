@@ -25,12 +25,12 @@
 
 attnres 当前架构是 **"nanochat 教学代码 + 若干 paper zoo + 事后 patch"** 的混合体，不是 coherent design。真实瓶颈排序：
 
-1. **推理层无 KV cache** → 算力被浪费 10-50×（decode 2048 只有 66 tok/s）
+1. ~~**推理层无 KV cache** → 算力被浪费 10-50×（decode 2048 只有 66 tok/s）~~ **(已做 2026-04-19，实际 2×，见 P0')**
 2. **数据严重不匹配** → 13726 样本训 400M 是 undertrained 3 个数量级，`over_refusal=6/64` 和顽固 halluc 是这里来的
 3. **定位错配** → tool-dispatcher 业务用了 generate-first 架构，wiki retrieve 被摆成二等公民
 4. **GQA 缺失** → KV cache 每序列 113 MB，3× 冗余
 
-VE 剪枝（f3929f1→083fbae 四连 commit）省了 18.7% 参数但属于**正确的低优先级事**——decode 吞吐只 +1-3%，因为 VE 不是 FLOP 热点。**我这一整晚被 P2 roadmap 带偏了**。
+**KV cache 实施教训**：我（2026-04-19 Claude）之前称 "10-50×" 是夸大——FA3 已把 no-cache attention 做成 O(T) 内存，真实 single-seq 收益上限就 2×。教训：**不要只从 paper/大厂文章抄 speedup 数字，要真 bench**。
 
 ---
 
@@ -40,24 +40,32 @@ VE 剪枝（f3929f1→083fbae 四连 commit）省了 18.7% 参数但属于**正�
 
 保留原文。短 prompt 8/8→8/8，长 prompt 4846 tokens 不再被截。
 
-### P0' · **KV cache**（立刻做，最高 ROI）
+### P0' · **KV cache**（✅ 2026-04-19 落地，但收益小于预期）
 
-**状态：未开工，这是新最高优先级。**
+**状态：已落地。decode T=2048 收益 1.95×（65.6 → 128.3 tok/s），非预期的 10-50×。**
 
-动机：`src/infer.py:311` 的 `logits = model(x[:, -max_context:])` 每 token 全重算，
-T=2048 decode 掉到 66 tok/s（T=256 时 120 tok/s，40% 下滑证明就是 attention 全重算造成的）。
+commits: f3929f1 之后接上（下一个 commit）。
 
-动作：
-1. 改 `src/train.py` 的 `CausalSelfAttention.forward` 支持 `past_kv: Optional[tuple[Tensor, Tensor]]` 参数；prefill 时返回 (k, v) 全量 cache，decode 时 append。
-2. 改 `GPT.forward` 支持 `past_kvs: list[tuple]` 和 `use_cache: bool`；返回 `(logits, new_kvs)`。
-3. 改 `src/infer.py` generate loop：prefill 整段 prompt 一次，decode 单 token forward + 增量 kv。
-4. 改 `_precompute_rotary_embeddings` / `apply_rotary_emb`：decode 时按 position offset 取 cos/sin 而非 [:T]。
-5. Benchmark：预期 decode 从 66 → 1000+ tok/s（15×+）。
+实施：
+1. `src/train.py`: `CausalSelfAttention.forward` / `Block.forward_attn_only` / `GPT.forward` 新增 `past_kv` / `past_kvs` / `use_cache` / `position_offset` 参数。默认行为（训练路径）零改动。
+2. `src/infer.py`: `generate()` 加 `next_to_feed` 状态变量，prefill 一次 prompt，decode 每步单 token forward；tool 注入走 prefill 增量。`--no-kv-cache` flag 回退。
+3. `scripts/test_kv_cache.py`: 16 步 argmax 对比，no-cache vs KV cache 完全一致（✓）。
+4. `scripts/bench_throughput.py`: 加 `use_cache` 参数对 A/B bench。
 
-代价：3-5 天工程 + 正确性 eval（输出应与无 cache 版本逐 token 一致）。
-是否作废 ckpt：**否**。纯推理端改动。
-成功标准：decode T=2048 吞吐 ≥ 500 tok/s，且 self_audit 64 条输出与无 cache 版逐条一致。
-失败回退：保留无 cache 路径作 `--no-kv-cache` flag。
+**为什么只有 2× 不是 10-50×**：
+- FA3 已经把 no-cache attention 优化成 O(T) memory（不是 O(T²)），"重算过去 K/V" 的 walltime 本来就不贵
+- KV cache 省的是 FLOPs，但单 seq decode 的小 batch matmul 是 memory-bound 不是 compute-bound，GPU 利用率低
+- 真正的 10-50× 在 **paged attention + continuous batching + multi-batch** —— 即 vLLM 路线，对多 seq 并发才有质变
+
+**结论修正**：
+- 我（Claude）之前声称"decode 10-50×"是错的 —— 是对多 batch/大模型/长 context 综合场景的夸大
+- 单 seq decode 的 KV cache 收益上限就是 ~2×
+- 但仍值得做：2× decode + 176 MB 显存是净收益，且 infra 改动小
+
+下一步优化方向（未做）：
+- 预分配 KV buffer 避免每步 `torch.cat` allocation
+- sliding window 裁剪 past_k/past_v（long chat 才 matter）
+- 多 batch + paged attention（另一个数量级工程，单独立项）
 
 ### P0.5 · 数据扩展到 ≥10k samples（两周内）
 

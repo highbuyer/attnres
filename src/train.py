@@ -155,7 +155,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer, getattr(config, "ve_layer_skip", ())) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, past_kv=None, use_cache=False):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -173,28 +173,46 @@ class CausalSelfAttention(nn.Module):
         if v.dtype != q.dtype:
             v = v.to(q.dtype)
 
+        # KV cache: append past and use concatenated k/v for attention (q stays new-only).
+        # past_k/v already have RoPE + norm applied at their prefill step.
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=1)
+            v = torch.cat([past_v, v], dim=1)
+        new_kv = (k, v) if use_cache else None
+
         if hasattr(fa3, 'flash_attn_func') and fa3.flash_attn_func is not None and q.is_cuda:
             y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # CPU fallback or non-FlashAttn environment
-            q_sdpa = q.transpose(1, 2) # (B, H, T, D)
-            k_sdpa = k.transpose(1, 2)
+            q_sdpa = q.transpose(1, 2) # (B, H, T_q, D)
+            k_sdpa = k.transpose(1, 2) # (B, Hkv, T_kv, D)
             v_sdpa = v.transpose(1, 2)
 
-            mask_rows = build_causal_window_mask(q.size(1), window_size)
+            T_q, T_kv = q.size(1), k.size(1)
+            mask_rows = build_causal_window_mask(T_kv, window_size)
             attn_mask = None
             if mask_rows is not None:
-                attn_mask = torch.tensor(mask_rows, device=q.device, dtype=torch.bool)
+                mask = torch.tensor(mask_rows, device=q.device, dtype=torch.bool)
+                # align to bottom-right (FA3 semantics): q attends rows [T_kv - T_q : T_kv]
+                attn_mask = mask[T_kv - T_q:T_kv, :]
+            else:
+                # causal bottom-right
+                row_idx = torch.arange(T_q, device=q.device).unsqueeze(1) + (T_kv - T_q)
+                col_idx = torch.arange(T_kv, device=q.device).unsqueeze(0)
+                attn_mask = col_idx <= row_idx
 
             y = torch.nn.functional.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=attn_mask,
-                is_causal=(attn_mask is None), # 如果手动提供了滑动窗口掩码，则关闭内置 causal
+                is_causal=False,  # 手动提供了 bottom-right causal 掩码
                 enable_gqa=(self.n_head != self.n_kv_head),
             )
-            y = y.transpose(1, 2) # (B, T, H, D)
+            y = y.transpose(1, 2) # (B, T_q, H, D)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
+        if use_cache:
+            return y, new_kv
         return y
 
 
@@ -225,9 +243,9 @@ class Block(nn.Module):
         """MLP with residual (standard use)."""
         return x + self.mlp(norm(x))
 
-    def forward_attn_only(self, h, ve, cos_sin, window_size):
+    def forward_attn_only(self, h, ve, cos_sin, window_size, past_kv=None, use_cache=False):
         """Attn without residual: paper AttnRes mode (h already is the attended state)."""
-        return self.attn(norm(h), ve, cos_sin, window_size)
+        return self.attn(norm(h), ve, cos_sin, window_size, past_kv=past_kv, use_cache=use_cache)
 
     def forward_mlp_only(self, h):
         """MLP without residual: paper AttnRes mode."""
@@ -395,10 +413,11 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def forward(self, idx, targets=None, reduction='mean', past_kvs=None, position_offset=0, use_cache=False):
         B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        T_past = past_kvs[0][0].size(1) if (past_kvs is not None and past_kvs[0] is not None) else position_offset
+        assert T + T_past <= self.cos.size(1), f"{T=}+{T_past=} exceeds rotary cache {self.cos.size(1)}"
+        cos_sin = self.cos[:, T_past:T_past + T], self.sin[:, T_past:T_past + T]
 
         x = self.transformer.wte(idx)
         x = norm(x)
@@ -425,6 +444,7 @@ class GPT(nn.Module):
         completed_blocks = []  # no detach: full grad flow
         partial_block = x      # b0 = token embedding (first block starts from embedding)
         sub_layer_count = 0
+        new_kvs = [] if use_cache else None
 
         for i, block in enumerate(self.transformer.h):
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
@@ -435,7 +455,14 @@ class GPT(nn.Module):
                 partial_block = None  # paper: new block starts fresh, first attn_out becomes partial
 
             h = block_attn_res(completed_blocks, partial_block, proj_idx=2*i)
-            attn_out = block.forward_attn_only(h, ve, cos_sin, self.window_sizes[i])
+            layer_past_kv = past_kvs[i] if past_kvs is not None else None
+            if use_cache:
+                attn_out, layer_new_kv = block.forward_attn_only(
+                    h, ve, cos_sin, self.window_sizes[i], past_kv=layer_past_kv, use_cache=True)
+                assert new_kvs is not None
+                new_kvs.append(layer_new_kv)
+            else:
+                attn_out = block.forward_attn_only(h, ve, cos_sin, self.window_sizes[i], past_kv=layer_past_kv)
             sub_layer_count += 1
             partial_block = attn_out if partial_block is None else partial_block + attn_out
 
@@ -456,6 +483,8 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
             return loss
+        if use_cache:
+            return logits, new_kvs
         return logits
 
 # ---------------------------------------------------------------------------
