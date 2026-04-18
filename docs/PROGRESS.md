@@ -92,6 +92,8 @@
   - self_audit v4（v5_best + w3 guard）：**tool_false_fire 7→0**，工具调用 13/13 零误伤；over_refusal 3→6（生产路径下由 `_research_fallback` 接管）。
   - 已同步到 `src/infer.py`、`scripts/self_audit.py`、`weiyan-api`。
   - 单测：`tests/test_inference_rules.py` 3/3 + smoke 11/11。
+- **w4 P1 tie_lm_head probe → 延期**：wte/lm_head 逐 token cos ≈ 0、norm 差 33×，零训练 tie 会崩；ckpt 收益仅 2.1%。改到 P2 下代预训一并处理，`docs/ARCH_ROADMAP.md` 已更新。
+- **w5 e2e 自省（2026-04-18）✅**：self_audit `--mode e2e` 跑完 wiki fallback 验证——6 条 over_refusal 中 4 条严格 recovered、2 条 off_topic。同时暴露 weiyan-api `_is_related` 过松（"世界上最高的山峰"被匹到"世界上最糟糕的人"）。详见 `docs/WEAKNESSES_v4_e2e.md`。
 
 ## Runtime 修复清单
 

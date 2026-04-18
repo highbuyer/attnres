@@ -52,11 +52,16 @@
 
 ### P1 · 下次 SFT 之前（一次短训）
 
-**开 `tie_lm_head=True`，省 25M。**
+> **状态：2026-04-18 probe 证伪，延期到下代预训（P2）一并处理。**
+> 权重几何 probe：v5_best 的 `wte` 与 `lm_head` 完全正交——逐 token cosine mean=-0.001、median=-0.001，norm 差 33 倍（106 vs 3.2）。二者学到的是互补信息，不是冗余。强行 tie 会让 lm_head 输出尺度放大 33×，softcap tanh 后变单峰崩溃，不经过相当步数训练无法恢复。
+> ckpt 体积收益原估 ~6%，重新量化后只有 2.1%（25M / 4.85G，VE 226M 才是大头）。代价（一次训练 + w1/w2 验证的能力退化风险）远超收益。
+> **结论**：当前 ckpt 上不做 tie。下代预训（P2）从第一步就把 `tie_lm_head=True` 作为 GPTConfig 默认，让 wte/lm_head 从头一起学，能真正受益。
 
-现状：`wte` 和 `lm_head` 各占 25M，二者在 400M 体量的小模型上学习的内容高度重叠（尤其工具 token 那 6 个 id）。省下来的 25M 留给主干。
+**扩 `tie_lm_head=True`，省 25M。**（历史设计保留）
 
-动作：
+现状：`wte` 和 `lm_head` 各占 25M，二者在 400M 体量的小模型上**理论上**可共享，但 v5_best 实际已训到完全解耦。
+
+动作（保留作未来 P2 时参考）：
 1. 把 ckpt 的 `lm_head.weight` 折叠成 `wte.weight`（二者已在训练中被推得接近，直接复制就行）。
 2. `GPTConfig.tie_lm_head = True`，加载时走 `lm_head.weight = wte.weight`（train.py:247-250 已实现）。
 3. 从 v5_best → 新 ckpt 跑 200-500 步 SFT 校准（lr 降到 2e-6，避免打穿已学到的 summary 能力）。
