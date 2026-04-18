@@ -43,6 +43,10 @@ MAX_GENERATE_TOKENS = 1024
 HEARTBEAT_EVERY_TOKENS = 128
 MAX_DECODE_SECONDS = 20
 RESEARCH_HTTP_TIMEOUT = 5  # 秒；联网查证单次请求上限
+# P0: 推理端上下文上限。训练 sequence_len=2048，通过 NTK-aware RoPE 外推到 8192。
+# 与 src/infer.py 的 INFER_MAX_CONTEXT 保持一致。
+INFER_MAX_CONTEXT = 8192
+PROMPT_RESERVE_TOKENS = 128  # 为 system + asst_id 等留的 buffer
 _model = None
 _tokenizer = None
 _generate_fn = None
@@ -589,6 +593,23 @@ def _init_model(checkpoint: str, tool_dir: str):
     cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
     model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
 
+    # P0: 推理端上下文外推 config.sequence_len → INFER_MAX_CONTEXT（NTK-aware RoPE + 重算 window_sizes）
+    if INFER_MAX_CONTEXT > config.sequence_len:
+        scale = INFER_MAX_CONTEXT / config.sequence_len
+        new_base = config.rope_theta * (scale ** (head_dim / (head_dim - 2)))
+        rotary_len = max(INFER_MAX_CONTEXT, int(getattr(model, "rotary_seq_len", INFER_MAX_CONTEXT)))
+        cos, sin = model._precompute_rotary_embeddings(rotary_len, head_dim, base=new_base, device=device)
+        model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
+        model.rotary_seq_len = rotary_len
+        pattern = config.window_pattern.upper()
+        long_window = INFER_MAX_CONTEXT
+        short_window = long_window // 2
+        char_to_window = {"L": (-1, -1), "S": (short_window, 0)}
+        new_sizes = [char_to_window[pattern[i % len(pattern)]] for i in range(config.n_layer)]
+        new_sizes[-1] = (long_window, 0)
+        model.window_sizes = new_sizes
+        print(f"[P0] inference context extended: {config.sequence_len} → {INFER_MAX_CONTEXT} (NTK RoPE)")
+
     metric_key = "val_bpt" if "val_bpt" in ckpt else "val_bpb"
     print(f"Model loaded: {Path(checkpoint).name}, {metric_key}={ckpt[metric_key]:.4f}, device={device}")
 
@@ -785,6 +806,21 @@ def _init_model(checkpoint: str, tool_dir: str):
         no_repeat_ngram = 4
 
         prompt_ids = [bos_id, user_id] + system_ids + tokenizer.encode(prompt_text) + [asst_id]
+        # P0 护栏：若 tokenize 后的 prompt 超过推理上下文预算，从 user prompt 段头部裁剪，
+        # 保留 bos + user_id + system + 尾部 user content + asst_id。
+        budget = INFER_MAX_CONTEXT - max_tokens - PROMPT_RESERVE_TOKENS
+        if budget < 512:
+            budget = 512  # 保底，避免 max_tokens 设得离谱时 budget 变负
+        if len(prompt_ids) > budget:
+            header_len = 2 + len(system_ids)  # bos + user_id + system
+            tail_room = budget - header_len - 1  # 预留 asst_id
+            if tail_room < 64:
+                tail_room = 64
+            user_tokens = prompt_ids[header_len:-1]
+            dropped = len(user_tokens) - tail_room
+            truncated_user = user_tokens[-tail_room:] if tail_room < len(user_tokens) else user_tokens
+            prompt_ids = [bos_id, user_id] + system_ids + truncated_user + [asst_id]
+            _debug(req_id, f"prompt truncated dropped={dropped} tokens budget={budget} final_len={len(prompt_ids)}")
         x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         generated_ids = []
         last_tool_result = None
@@ -816,7 +852,7 @@ def _init_model(checkpoint: str, tool_dir: str):
 
                 with torch.no_grad(), autocast_ctx:
 
-                    logits = model(x[:, -config.sequence_len:])[:, -1, :]
+                    logits = model(x[:, -INFER_MAX_CONTEXT:])[:, -1, :]
 
                 # no_repeat_ngram: 禁掉会造成 n-gram 重复的 token
                 if no_repeat_ngram > 1 and len(round_ids) >= no_repeat_ngram - 1:

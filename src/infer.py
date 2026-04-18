@@ -80,6 +80,41 @@ from project_paths import resolve_default_checkpoint  # noqa: E402
 from tool_protocol import execute_tool, parse_tool_call, strip_tool_markup  # noqa: E402
 
 
+# P0: 推理端上下文上限。训练 sequence_len=2048，通过 NTK-aware RoPE 外推到 8192。
+# 不作废任何 ckpt；只改推理。超过此长度的 prompt 由调用方在 tokenize 后截断。
+INFER_MAX_CONTEXT = 8192
+
+
+def extend_context(model, config, max_context: int, device, model_dtype):
+    """P0: 把模型的有效上下文从 config.sequence_len 外推到 max_context。
+
+    动作：
+    1) NTK-aware RoPE base 重算：new_base = rope_theta * (scale ** (d/(d-2))), scale = max_context/sequence_len
+    2) 用新 base + max_context 长度重算 cos/sin，覆盖 model.cos/model.sin
+    3) 重算 model.window_sizes：S 层取 max_context//2, L 层 -1, 最后一层强制 L
+
+    注意不修改 config.sequence_len：训练元信息保持原样，只在推理端扩。
+    """
+    if max_context <= config.sequence_len:
+        return  # 没有外推需求
+    head_dim = config.n_embd // config.n_head
+    scale = max_context / config.sequence_len
+    new_base = config.rope_theta * (scale ** (head_dim / (head_dim - 2)))
+    # rotary_seq_len_mult 默认 10，但若 ckpt 来自老 config，mult 可能比 max_context/sequence_len 小
+    rotary_len = max(max_context, int(getattr(model, "rotary_seq_len", max_context)))
+    cos, sin = model._precompute_rotary_embeddings(rotary_len, head_dim, base=new_base, device=device)
+    model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
+    model.rotary_seq_len = rotary_len
+    # 重算 window_sizes（原值用 config.sequence_len=2048 切窗口，外推后必须同步放大）
+    pattern = config.window_pattern.upper()
+    long_window = max_context
+    short_window = long_window // 2
+    char_to_window = {"L": (-1, -1), "S": (short_window, 0)}
+    new_sizes = [char_to_window[pattern[i % len(pattern)]] for i in range(config.n_layer)]
+    new_sizes[-1] = (long_window, 0)
+    model.window_sizes = new_sizes
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inference for attnres checkpoints")
     parser.add_argument("prompt", nargs="?", default=None, help="Optional one-shot prompt")
@@ -93,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp32", action="store_true", help="Force fp32 weights (requires CUDA; FlashAttention does not support CPU)")
     parser.add_argument("--rep-penalty", type=float, default=1.3, help="Repetition penalty (1.0=off, >1 reduces repetition)")
     parser.add_argument("--rope-theta", type=float, default=None, help="RoPE base frequency (NTK scaling: e.g. 500000 for longer context)")
+    parser.add_argument("--max-context", type=int, default=INFER_MAX_CONTEXT, help=f"Effective context length at inference (default {INFER_MAX_CONTEXT}, ckpt trained at 2048; uses NTK-aware RoPE extension)")
     parser.add_argument("--tool-dir", type=str, default=".", help="工具调用的工作目录（search_code/read_file 在此目录下执行）")
     parser.add_argument("--no-tools", action="store_true", help="禁用工具调用执行（模型仍可能输出工具调用格式，但不会执行）")
     return parser.parse_args()
@@ -167,6 +203,12 @@ def main() -> None:
         config.rope_theta = args.rope_theta
     cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
     model.cos, model.sin = cos.to(model_dtype), sin.to(model_dtype)
+
+    # P0: 推理端上下文外推。若 --max-context > config.sequence_len，NTK 重算 RoPE + window_sizes。
+    max_context = max(args.max_context, config.sequence_len)
+    if max_context > config.sequence_len:
+        extend_context(model, config, max_context, device, model_dtype)
+        print(f"[P0] inference context extended: {config.sequence_len} → {max_context} (NTK RoPE)")
 
     tokenizer = Tokenizer.from_directory()
     bos_id = tokenizer.get_bos_token_id()
@@ -263,7 +305,7 @@ def main() -> None:
             round_flushed = False
             for _ in range(args.max_tokens):
                 with torch.no_grad(), autocast_ctx:
-                    logits = model(x[:, -config.sequence_len:])
+                    logits = model(x[:, -max_context:])
                     logits = logits[:, -1, :]
 
                 if args.rep_penalty != 1.0 and (generated_ids or round_ids):
