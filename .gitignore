@@ -35,14 +35,16 @@ logs/
 
 # Training artifacts and datasets
 checkpoints/
-data
+/data
+/datasets/sft_archive/
 /sft_*.jsonl
 
-# Generated evaluation outputs
+# Generated evaluation / run outputs
 /eval_results_*.json
 /eval_tool_format_*.json
 /inspect_tool_start_logits_*.json
 /run.log
+/runs/
 
 # Generated script outputs
 scripts/__pycache__/
@@ -57,6 +59,3 @@ scripts/eval_results_*.json
 src/__pycache__/
 tests/__pycache__/
 src/run.log
-
-# Local doc duplicates
-docs/attnres (1).txt
