@@ -95,6 +95,10 @@ def main():
     parser.add_argument("--out", default="runs/ve_ablation.jsonl")
     parser.add_argument("--max-val-samples", type=int, default=None,
                         help="若 val 太大可截断到这个数以压缩 eval 时间；None=全量")
+    parser.add_argument("--trials", default=None,
+                        help="只跑指定 name 的 trial，逗号分隔；缺省=全跑")
+    parser.add_argument("--summary-out", default="docs/VE_ABLATION_v1.md",
+                        help="markdown 汇总输出路径；v2 全量复现请指向新文件避免覆盖")
     args = parser.parse_args()
 
     sft_mod._ensure_model_defs()
@@ -147,6 +151,14 @@ def main():
     # 校正 keep_deep3：VE_LAYERS 9 层，留 3 层最深 → {13,15,17}，knock 其余 6 层
     trials = [(name, layers) for name, layers in trials if name != "keep_deep3"]
     trials.append(("keep_deep3", [1, 3, 5, 7, 9, 11]))
+    # weakest 3 合砍：P2 候选方案，ablation v1 之外补测
+    trials.append(("knock_weakest3", [13, 15, 17]))
+
+    if args.trials:
+        wanted = {s.strip() for s in args.trials.split(",") if s.strip()}
+        trials = [(n, l) for n, l in trials if n in wanted]
+        if not trials:
+            raise SystemExit(f"--trials filter 没匹配到任何 name，可选：{wanted}")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
@@ -176,7 +188,7 @@ def main():
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # 输出 markdown 摘要
-    summary_path = Path("docs/VE_ABLATION_v1.md")
+    summary_path = Path(args.summary_out)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "# VE Ablation v1 — zero-training probe of 9-layer value embeddings",
