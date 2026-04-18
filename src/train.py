@@ -114,14 +114,19 @@ class GPTConfig:
     rope_seq_len_mult: int = 10  # rotary 预计算长度倍率；为长文本 NTK 扩展留余地。生产训练可降到 2
     softcap: float = 15.0        # 输出 logit 的 tanh 软顶
     tie_lm_head: bool = False    # True 时 lm_head.weight 与 wte.weight 共享（省 25M 参数）
+    ve_layer_skip: tuple = ()    # P2: 砍掉指定层的 VE（value_embeds + ve_gate）。见 docs/VE_ABLATION_v2_full.md
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
+def has_ve(layer_idx, n_layer, skip=()):
+    """Returns True if layer should have Value Embedding (alternating, last always included).
+
+    skip: iterable of layer indices to force-exclude (P2 VE pruning, see ve_layer_skip)."""
+    if layer_idx in set(skip):
+        return False
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
@@ -148,7 +153,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer, getattr(config, "ve_layer_skip", ())) else None
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -260,7 +265,7 @@ class GPT(nn.Module):
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+            for i in range(config.n_layer) if has_ve(i, config.n_layer, getattr(config, "ve_layer_skip", ()))
         })
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * getattr(config, "rope_seq_len_mult", 10)
