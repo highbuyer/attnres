@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-interval", type=int, default=None, help="Validation interval override")
     parser.add_argument("--batch-size", type=int, default=None, help="Device batch size override")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps override")
+    parser.add_argument("--grad-ckpt", action="store_true", help="Enable gradient checkpointing (recompute attn/mlp activations)")
     return parser.parse_args()
 
 
@@ -177,6 +178,37 @@ def save_best_artifacts(path, ckpt):
 
 DROPPED_SAMPLE_COUNT = 0
 TRUNCATED_SAMPLE_COUNT = 0
+
+
+def _enable_gradient_checkpointing(model):
+    """对每个 block 的 forward_attn_only / forward_mlp_only 包 checkpoint。
+
+    SFT 场景 past_kv=None、use_cache=False，不走 KV cache 路径。eval 时
+    torch.is_grad_enabled()=False 自动 fall-through 到原实现，不重算。
+    """
+    import torch
+    from torch.utils.checkpoint import checkpoint
+
+    for block in model.transformer.h:
+        orig_attn = block.forward_attn_only
+        orig_mlp = block.forward_mlp_only
+
+        def make_attn(orig):
+            def attn_ckpt(h, ve, cos_sin, window_size, past_kv=None, use_cache=False):
+                if use_cache or past_kv is not None or not torch.is_grad_enabled():
+                    return orig(h, ve, cos_sin, window_size, past_kv=past_kv, use_cache=use_cache)
+                return checkpoint(orig, h, ve, cos_sin, window_size, use_reentrant=False)
+            return attn_ckpt
+
+        def make_mlp(orig):
+            def mlp_ckpt(h):
+                if not torch.is_grad_enabled():
+                    return orig(h)
+                return checkpoint(orig, h, use_reentrant=False)
+            return mlp_ckpt
+
+        block.forward_attn_only = make_attn(orig_attn)
+        block.forward_mlp_only = make_mlp(orig_mlp)
 
 
 def tokenize_turn(message):
@@ -414,10 +446,20 @@ def main() -> None:
     cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)
     model.cos, model.sin = cos.to(compute_dtype), sin.to(compute_dtype)
 
+    if args.grad_ckpt:
+        _enable_gradient_checkpointing(model)
+        print("  Gradient checkpointing: ON (recompute attn/mlp activations, -30% memory, +20% time)")
+
     metric_key = "val_bpt" if "val_bpt" in ckpt else "val_bpb"
     print(f"Checkpoint {checkpoint_in}: {metric_key}={ckpt[metric_key]:.4f}, step={ckpt['step']}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+        print("  Optimizer: bitsandbytes.AdamW8bit (saves ~2.4GB optimizer state vs fp32 AdamW)")
+    except ImportError:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+        print("  Optimizer: torch.AdamW (bitsandbytes unavailable)")
     resume_step, best_val_bpt = resolve_resume_state(ckpt, args.resume)
     if args.resume:
         optimizer.load_state_dict(ckpt["optimizer_state"])
