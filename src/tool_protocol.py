@@ -53,7 +53,8 @@ def _parse_tool_call_inner(inner: str) -> tuple[str, dict] | None:
         tag = f"<|tool_name_{candidate}|>"
         if tag in inner:
             tool_name = candidate
-            inner = inner.replace(tag, "", 1).strip()
+            # 400M 模型常输出重复 tag（<|tool_name_X|><|tool_name_X|>{...}），全部去除
+            inner = inner.replace(tag, "").strip()
             break
 
     if tool_name is None:

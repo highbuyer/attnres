@@ -227,6 +227,86 @@ _EMPTY_TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9\-]*\s*/?>|</[a-zA-Z][a-zA-Z0-9\
 _META_NOISE_PATTERNS = (_SYSTEM_REMINDER_RE, _LOCAL_CAVEAT_RE, _COMMAND_BLOCK_RE)
 
 
+# ---------------------------------------------------------------------------
+# 400M 模型在 tool_call JSON 参数上幻觉 query/path（见 memory
+# feedback_cc_400m_ceiling.md）。推理侧后处理：若模型生成的 query/path
+# 不是 user prompt 字面子串，直接从 user prompt 抽最显眼 symbol/path 替代。
+# 400M 的 query 幻觉与 user 语义无关，字面相似度匹配无效，必须硬替换。
+# ---------------------------------------------------------------------------
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_PATH_RE = re.compile(r"(?:[A-Za-z_][\w\-]*/)+[\w\-\.]+\.(?:py|md|json|txt|sh|yaml|yml)")
+_OPT_RE = re.compile(r"--[a-z][a-z0-9\-]+")
+
+
+def _pick_query_from_prompt(prompt_text: str) -> str | None:
+    """从 user prompt 选最显眼的 identifier 作为 search query。优先级：
+    反引号包裹 > --option > UPPER_CASE 常量 > 最长 snake_case identifier。
+    """
+    if not prompt_text:
+        return None
+    # 1. 反引号里的第一个 identifier / option / path-like
+    for m in _BACKTICK_RE.findall(prompt_text):
+        m = m.strip()
+        if _OPT_RE.fullmatch(m) or _SYMBOL_RE.fullmatch(m):
+            return m
+        # 反引号里可能是 path 或复合表达，取第一个 identifier/option
+        opt = _OPT_RE.search(m)
+        if opt:
+            return opt.group(0)
+        sym = _SYMBOL_RE.search(m)
+        if sym:
+            return sym.group(0)
+    # 2. --option
+    opts = _OPT_RE.findall(prompt_text)
+    if opts:
+        return opts[0]
+    # 3. UPPER_CASE 常量
+    uppers = [s for s in _SYMBOL_RE.findall(prompt_text) if s.isupper() and len(s) >= 4]
+    if uppers:
+        return uppers[0]
+    # 4. 最长的 snake_case identifier（有 _ 的优先）
+    syms = [s for s in _SYMBOL_RE.findall(prompt_text) if len(s) >= 4]
+    snake = [s for s in syms if "_" in s]
+    if snake:
+        return max(snake, key=len)
+    if syms:
+        return max(syms, key=len)
+    return None
+
+
+def _pick_path_from_prompt(prompt_text: str) -> str | None:
+    paths = _PATH_RE.findall(prompt_text)
+    return paths[0] if paths else None
+
+
+def _sanitize_tool_params(prompt_text: str, tool_name: str, params: dict, debug=None) -> dict:
+    """字面校验 params；不字面则直接硬替换为 user prompt 的显眼候选。"""
+    if not isinstance(params, dict) or not prompt_text:
+        return params
+    fixed = dict(params)
+    changed: list[str] = []
+    for key in ("query", "path"):
+        if key not in fixed:
+            continue
+        val = fixed[key]
+        if not isinstance(val, str) or not val.strip():
+            continue
+        if val in prompt_text:
+            continue  # 已字面，不动
+        replacement = _pick_path_from_prompt(prompt_text) if key == "path" else _pick_query_from_prompt(prompt_text)
+        if replacement and replacement != val:
+            fixed[key] = replacement
+            changed.append(f"{key}:{val!r}→{replacement!r}")
+        elif key == "path":
+            # path 幻觉且 user 里也无 path 候选 → 删除让搜索走全仓根
+            del fixed[key]
+            changed.append(f"{key}:{val!r}→(removed)")
+    if changed and debug:
+        debug(f"tool_params sanitize tool={tool_name} {' '.join(changed)}")
+    return fixed
+
+
 def _sanitize_long_prompt(prompt_text: str, max_chars: int = 4000) -> str:
     """剥离 system-reminder / local-command-* / command-* 等噪声块，并清理残留空标签。"""
     if not prompt_text:
@@ -694,6 +774,7 @@ def _init_model(checkpoint: str, tool_dir: str):
 
             if tool_parsed and tool_dir:
                 tool_name, params = tool_parsed
+                params = _sanitize_tool_params(prompt_text, tool_name, params, debug=lambda m: _debug(req_id, m))
                 _debug(req_id, f"tool detected round={_round + 1} name={tool_name} args={_preview(params)!r}")
                 tool_t0 = time.time()
                 try:
