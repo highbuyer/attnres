@@ -45,7 +45,7 @@ FINAL_LR_FRAC = 0.05
 TOTAL_BATCH_SIZE = 2**19    # ~524K tokens per step
 DEVICE_BATCH_SIZE = int(os.environ.get('CPT_BATCH', 8))       # depth=18: 196M; d36 建议降到 2
 EVAL_INTERVAL = int(os.environ.get('CPT_EVAL_INTERVAL', 250))
-EARLY_STOP_PATIENCE = 3
+EARLY_STOP_PATIENCE = int(os.environ.get('CPT_PATIENCE', 8))
 
 # ---------------------------------------------------------------------------
 # 加载模型定义（复用 train.py）
