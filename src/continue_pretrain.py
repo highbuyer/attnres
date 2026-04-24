@@ -178,33 +178,43 @@ model_dim = config.n_embd
 dmodel_lr_scale = (model_dim / 768) ** -0.5
 print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-# 获取模型参数
-matrix_params = list(model.transformer.h.parameters())
+# 获取模型参数（排除 scalar 参数）
+scalar_param_names = set()
+for name, param in model.named_parameters():
+    if any(scalar_name in name for scalar_name in ['softcap_logit', 'norm_gain', 'logit_scale']):
+        scalar_param_names.add(name)
+
+matrix_params = [p for n, p in model.transformer.h.named_parameters() if n not in scalar_param_names]
 all_value_embeds_params = list(model.value_embeds.parameters())
 embedding_params = list(model.transformer.wte.parameters())
 lm_head_params = list(model.lm_head.parameters())
 attnres_proj_params = list(model.attnres_proj.parameters())
 attnres_norm_params = list(model.attnres_norm.parameters())
 
-# 分离新旧 VE 层参数（假设前 18 层是旧层，19+ 是新层）
+# 分离新旧 VE 层参数（d36 模型：前 18 层是旧层，18-35 是新层）
 # 通过参数名判断：value_embeds.<layer_id>.weight
+# 动态计算分界点：总层数的一半
+num_ve_layers = len(list(model.value_embeds))
+split_layer = num_ve_layers // 2
+print(f"Total VE layers: {num_ve_layers}, split at layer {split_layer}")
+
 old_ve_params = []
 new_ve_params = []
 for name, param in model.value_embeds.named_parameters():
-    # 提取 layer id: value_embeds.<id>.weight
+    # 提取 layer id: value_embeds 是 ModuleList, named_parameters() 返回 "0.weight", "1.weight", ...
     parts = name.split('.')
-    if len(parts) >= 2 and parts[0].isdigit():
+    if len(parts) >= 1 and parts[0].isdigit():
         layer_id = int(parts[0])
-        if layer_id < 18:  # 旧层
+        if layer_id < split_layer:  # 旧层
             old_ve_params.append(param)
-        else:  # 新层 (18+)
+        else:  # 新层
             new_ve_params.append(param)
     else:
         # 默认归入旧层
         old_ve_params.append(param)
 
-print(f"Old VE layers (<18): {len(old_ve_params)} params")
-print(f"New VE layers (>=18): {len(new_ve_params)} params")
+print(f"Old VE layers (<{split_layer}): {len(old_ve_params)} params")
+print(f"New VE layers (>={split_layer}): {len(new_ve_params)} params")
 
 # 构建参数组
 param_groups = [
@@ -215,6 +225,15 @@ param_groups = [
     dict(kind='adamw', params=attnres_proj_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
     dict(kind='adamw', params=attnres_norm_params, lr=0.15, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
 ]
+
+# Scalar 参数单独分组（softcap_logit, norm_gain 等）
+scalar_params = []
+for name, param in model.named_parameters():
+    if any(scalar_name in name for scalar_name in ['softcap_logit', 'norm_gain', 'logit_scale']):
+        scalar_params.append(param)
+if scalar_params:
+    param_groups.append(dict(kind='adamw', params=scalar_params, lr=SCALAR_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
+    print(f"Scalar params: {len(scalar_params)}")
 
 # Matrix 参数按 shape 分组（Muon 优化器）
 for shape in sorted({p.shape for p in matrix_params}):
