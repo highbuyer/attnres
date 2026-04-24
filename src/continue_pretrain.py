@@ -199,10 +199,9 @@ lm_head_params = list(model.lm_head.parameters())
 attnres_proj_params = list(model.attnres_proj.parameters())
 attnres_norm_params = list(model.attnres_norm.parameters())
 
-# 分离新旧 VE 层参数（d36 模型：前 18 层是旧层，18-35 是新层）
-# 通过参数名判断：value_embeds.<layer_id>.weight
-# 动态计算分界点：总层数的一半
-num_ve_layers = len(list(model.value_embeds))
+# 分离新旧 VE 层参数（动态计算分界点：总层数的一半）
+# value_embeds 是 ModuleList, named_parameters() 返回 "0.weight", "1.weight", ...
+num_ve_layers = len(model.value_embeds)
 split_layer = num_ve_layers // 2
 print(f"Total VE layers: {num_ve_layers}, split at layer {split_layer}")
 
