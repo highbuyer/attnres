@@ -1,70 +1,71 @@
-# Python-generated files
+# Compiled and build artifacts
+*.pyc
 __pycache__/
-*.py[oc]
-build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
 dist/
-wheels/
-*.egg-info
+build/
+target/
 
-# Virtual environments
+# Dependencies
 .venv/
-.python-version
-worktrees/
-results/
-queue/
+venv/
+node_modules/
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+.gradle/
+julia-*/
+zig*/
 
-# Agent prompt files (generated per-session by launchers)
-CLAUDE.md
-AGENTS.md
-
-# Experimental code/artifacts
-dev/
-
-# Results file
-results.tsv
-
-# Local agent/editor state
-.claude/
-.omc/
-.specstory/
-.cursorindexingignore
-
-# Logs
+# Logs and temp files
 *.log
-logs/
+*.tmp
+*.swp
+*.swo
 
-# Training artifacts and datasets
-checkpoints/
-/data
-/datasets/sft_archive/
-/sft_*.jsonl
+# Environment
+.env
+.env.local
+*.env.*
 
-# Generated evaluation / run outputs
-/eval_results_*.json
-/eval_tool_format_*.json
-/inspect_tool_start_logits_*.json
-/run.log
-/runs/
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Generated script outputs
-scripts/__pycache__/
-scripts/results.tsv
-scripts/search_best.json
-scripts/search_results.csv
-scripts/search_results.db
-scripts/settings.dmid.json
-scripts/eval_results_*.json
+# System files
+.DS_Store
+Thumbs.db
 
-# Module/test caches
-src/__pycache__/
-tests/__pycache__/
-src/run.log
-
-# weiyan-api runtime state
-.weiyan-session.json
-
-# Temporary analysis scripts
-tmp_*.py
-
-# Unrelated PDFs
-*.pdf
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst

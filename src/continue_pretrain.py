@@ -37,6 +37,9 @@ SCALAR_LR = 0.025
 WEIGHT_DECAY = 0.01
 ADAM_BETAS = (0.8, 0.95)
 
+# 分层学习率：新 VE 层使用更高 LR 打破对称性
+NEW_VE_LR_SCALE = float(os.environ.get('NEW_VE_LR_SCALE', '20.0'))  # 新 VE 层 LR 倍数
+
 TOTAL_STEPS = int(os.environ.get('CPT_STEPS', 500))
 WARMUP_RATIO = 0.05         # 25 steps warmup
 WARMDOWN_RATIO = 0.6
@@ -170,16 +173,90 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
+# 分层学习率优化器：新 VE 层使用更高 LR 打破对称性
+model_dim = config.n_embd
+dmodel_lr_scale = (model_dim / 768) ** -0.5
+print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+
+# 获取模型参数（排除 scalar 参数和 1D 参数）
+scalar_param_names = set()
+for name, param in model.named_parameters():
+    if any(scalar_name in name for scalar_name in ['softcap_logit', 'norm_gain', 'logit_scale']):
+        scalar_param_names.add(name)
+
+# Matrix 参数：只保留 2D 参数（Muon 优化器要求）
+# 排除 scalar 参数和 1D 参数（如 LayerNorm weights/biases）
+matrix_params = [p for n, p in model.transformer.h.named_parameters() 
+                 if n not in scalar_param_names and p.dim() == 2]
+
+# 1D 参数（LayerNorm 等）单独分组，使用 AdamW
+norm_1d_params = [p for n, p in model.transformer.h.named_parameters() 
+                  if n not in scalar_param_names and p.dim() == 1]
+
+all_value_embeds_params = list(model.value_embeds.parameters())
+embedding_params = list(model.transformer.wte.parameters())
+lm_head_params = list(model.lm_head.parameters())
+attnres_proj_params = list(model.attnres_proj.parameters())
+attnres_norm_params = list(model.attnres_norm.parameters())
+
+# 分离新旧 VE 层参数（动态计算分界点：总层数的一半）
+# value_embeds 是 ModuleList, named_parameters() 返回 "0.weight", "1.weight", ...
+num_ve_layers = len(model.value_embeds)
+split_layer = num_ve_layers // 2
+print(f"Total VE layers: {num_ve_layers}, split at layer {split_layer}")
+
+old_ve_params = []
+new_ve_params = []
+for name, param in model.value_embeds.named_parameters():
+    # 提取 layer id: value_embeds 是 ModuleList, named_parameters() 返回 "0.weight", "1.weight", ...
+    parts = name.split('.')
+    if len(parts) >= 1 and parts[0].isdigit():
+        layer_id = int(parts[0])
+        if layer_id < split_layer:  # 旧层
+            old_ve_params.append(param)
+        else:  # 新层
+            new_ve_params.append(param)
+    else:
+        # 默认归入旧层
+        old_ve_params.append(param)
+
+print(f"Old VE layers (<{split_layer}): {len(old_ve_params)} params")
+print(f"New VE layers (>={split_layer}): {len(new_ve_params)} params")
+
+# 构建参数组
+param_groups = [
+    dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    dict(kind='adamw', params=embedding_params, lr=EMBEDDING_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    dict(kind='adamw', params=old_ve_params, lr=EMBEDDING_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    dict(kind='adamw', params=new_ve_params, lr=EMBEDDING_LR * dmodel_lr_scale * NEW_VE_LR_SCALE, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    dict(kind='adamw', params=attnres_proj_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    dict(kind='adamw', params=attnres_norm_params, lr=0.15, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    # 1D 参数（LayerNorm weights/biases）使用 AdamW
+    dict(kind='adamw', params=norm_1d_params, lr=MATRIX_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+]
+
+# Scalar 参数单独分组（softcap_logit, norm_gain 等）
+scalar_params = []
+for name, param in model.named_parameters():
+    if any(scalar_name in name for scalar_name in ['softcap_logit', 'norm_gain', 'logit_scale']):
+        scalar_params.append(param)
+if scalar_params:
+    param_groups.append(dict(kind='adamw', params=scalar_params, lr=SCALAR_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
+    print(f"Scalar params: {len(scalar_params)}")
+
+# Matrix 参数按 shape 分组（Muon 优化器）
+for shape in sorted({p.shape for p in matrix_params}):
+    group_params = [p for p in matrix_params if p.shape == shape]
+    param_groups.append(dict(
+        kind='muon', params=group_params, lr=MATRIX_LR,
+        momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY,
+    ))
+
+optimizer = MuonAdamW(param_groups)
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
+
+print(f"New VE LR scale: {NEW_VE_LR_SCALE}x (LR = {EMBEDDING_LR * dmodel_lr_scale * NEW_VE_LR_SCALE:.6f})")
 
 if os.environ.get('NO_COMPILE') != '1' and device.type == 'cuda':
     model = torch.compile(model, dynamic=False)
