@@ -5,6 +5,23 @@ build/
 dist/
 wheels/
 *.egg-info
+*.egg
+*.so
+*.pyd
+*.pyo
+.Python
+.lib/
+lib/
+lib64/
+parts/
+sdist/
+var/
+develop-eggs/
+eggs/
+.eggs/
+*.installed.cfg
+*.manifest
+*.spec
 
 # Virtual environments
 .venv/
@@ -12,6 +29,9 @@ wheels/
 worktrees/
 results/
 queue/
+venv/
+env/
+ENV/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
@@ -68,3 +88,61 @@ tmp_*.py
 
 # Unrelated PDFs
 *.pdf
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# MyPy / Pytest
+.mypy_cache/
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Temp files
+*.tmp
+*.temp
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+
+# Compiled artifacts
+*.o
+*.obj
+*.class
+*.exe
+*.dll
+*.a
+*.out
+
+# Build tools
+.gradle/
+target/
+node_modules/
+
+# Julia
+julia-*/
+zig*/
