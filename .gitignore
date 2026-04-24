@@ -62,3 +62,9 @@ src/run.log
 
 # weiyan-api runtime state
 .weiyan-session.json
+
+# Temporary analysis scripts
+tmp_*.py
+
+# Unrelated PDFs
+*.pdf

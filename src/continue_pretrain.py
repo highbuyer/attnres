@@ -24,10 +24,10 @@ import sys
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 # ---------------------------------------------------------------------------
-# Config
+# Config（支持 env var / sys.argv 覆盖）
 # ---------------------------------------------------------------------------
 CHECKPOINT_IN = sys.argv[1] if len(sys.argv) > 1 else 'checkpoints/tooltoken_d18_32k.pt'
-CHECKPOINT_OUT = 'checkpoints/tooltoken_continued.pt'
+CHECKPOINT_OUT = os.environ.get('CPT_OUT', 'checkpoints/tooltoken_continued.pt')
 
 # 降低的学习率（约为预训练的 1/4）
 MATRIX_LR = 0.01
@@ -37,14 +37,14 @@ SCALAR_LR = 0.025
 WEIGHT_DECAY = 0.01
 ADAM_BETAS = (0.8, 0.95)
 
-TOTAL_STEPS = 500
+TOTAL_STEPS = int(os.environ.get('CPT_STEPS', 500))
 WARMUP_RATIO = 0.05         # 25 steps warmup
 WARMDOWN_RATIO = 0.6
 FINAL_LR_FRAC = 0.05
 
 TOTAL_BATCH_SIZE = 2**19    # ~524K tokens per step
-DEVICE_BATCH_SIZE = 8       # depth=18: 196M，显存比depth=24少
-EVAL_INTERVAL = 250
+DEVICE_BATCH_SIZE = int(os.environ.get('CPT_BATCH', 8))       # depth=18: 196M; d36 建议降到 2
+EVAL_INTERVAL = int(os.environ.get('CPT_EVAL_INTERVAL', 250))
 EARLY_STOP_PATIENCE = 3
 
 # ---------------------------------------------------------------------------
@@ -129,6 +129,31 @@ if load_result.missing_keys:
 if load_result.unexpected_keys:
     print(f'WARNING: unexpected keys: {load_result.unexpected_keys}')
 model.to(dtype=param_dtype)
+
+# gradient checkpointing：d36 seq=2048 backward 内存峰过高，需要重算激活
+if os.environ.get('CPT_GRAD_CKPT', '0') == '1':
+    from torch.utils.checkpoint import checkpoint
+    for block in model.transformer.h:
+        orig_attn = block.forward_attn_only
+        orig_mlp = block.forward_mlp_only
+
+        def make_attn(orig):
+            def attn_ckpt(h, ve, cos_sin, window_size, past_kv=None, use_cache=False):
+                if use_cache or past_kv is not None or not torch.is_grad_enabled():
+                    return orig(h, ve, cos_sin, window_size, past_kv=past_kv, use_cache=use_cache)
+                return checkpoint(orig, h, ve, cos_sin, window_size, use_reentrant=False)
+            return attn_ckpt
+
+        def make_mlp(orig):
+            def mlp_ckpt(h):
+                if not torch.is_grad_enabled():
+                    return orig(h)
+                return checkpoint(orig, h, use_reentrant=False)
+            return mlp_ckpt
+
+        block.forward_attn_only = make_attn(orig_attn)
+        block.forward_mlp_only = make_mlp(orig_mlp)
+    print("Gradient checkpointing: ON (recompute attn/mlp activations)")
 
 head_dim = config.n_embd // config.n_head
 cos, sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim, device=device)

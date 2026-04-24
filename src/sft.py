@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None, help="Device batch size override")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps override")
     parser.add_argument("--grad-ckpt", action="store_true", help="Enable gradient checkpointing (recompute attn/mlp activations)")
+    parser.add_argument("--max-samples", type=int, default=None, help="Only use first N records from data (for smoke test / subset training)")
     return parser.parse_args()
 
 
@@ -293,13 +294,113 @@ def format_samples_split(messages):
     return samples
 
 
-def build_datasets(data_path: str):
+def _render_minimind_system(convs, tools):
+    if not tools and not (convs and convs[0].get("role") == "system" and convs[0].get("content")):
+        return ""
+    if tools:
+        sys_content = convs[0].get("content", "") if convs and convs[0].get("role") == "system" else ""
+        tools_block = (
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>"
+        )
+        for tool in tools:
+            tools_block += "\n" + json.dumps(tool, ensure_ascii=False)
+        tools_block += (
+            "\n</tools>\n\nFor each function call, return a json object with function name and "
+            "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+            '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>'
+        )
+        head = sys_content + "\n\n" if sys_content else ""
+        return f"<|im_start|>system\n{head}{tools_block}<|im_end|>\n"
+    return f"<|im_start|>system\n{convs[0]['content']}<|im_end|>\n"
+
+
+def _render_minimind_assistant(msg):
+    content = msg.get("content", "") or ""
+    rc = msg.get("reasoning_content", "") or ""
+    body = "<think>\n" + rc.strip("\n") + "\n</think>\n\n" + content.lstrip("\n")
+    tcs = msg.get("tool_calls")
+    if tcs:
+        if isinstance(tcs, str):
+            tcs = json.loads(tcs)
+        for i, tc in enumerate(tcs):
+            if (i == 0 and content) or i > 0:
+                body += "\n"
+            fn = tc.get("function", tc)
+            args = fn.get("arguments", "")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            body += '<tool_call>\n{"name": "' + fn["name"] + '", "arguments": ' + args + "}\n</tool_call>"
+    return body
+
+
+def format_minimind_record(record):
+    """将 minimind conversations 格式 → 一个 (ids, mask) 样本。
+
+    loss_mask 规则：<|im_start|>assistant\\n...<|im_end|>\\n 块内的 body+suffix 为 1，其他为 0。
+    """
+    _ensure_tokenizer()
+    convs = record.get("conversations") or record.get("messages") or []
+    if not convs:
+        return []
+
+    tools = None
+    if convs and convs[0].get("role") == "system" and convs[0].get("tools"):
+        t = convs[0]["tools"]
+        tools = json.loads(t) if isinstance(t, str) else t
+
+    chunks = []
+    sys_text = _render_minimind_system(convs, tools)
+    if sys_text:
+        chunks.append(("system", sys_text))
+
+    start_idx = 1 if convs and convs[0].get("role") == "system" else 0
+    for m in convs[start_idx:]:
+        role = m.get("role")
+        content = m.get("content", "") or ""
+        if role == "user":
+            chunks.append(("user", f"<|im_start|>user\n{content}<|im_end|>\n"))
+        elif role == "tool":
+            chunks.append(("tool", f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"))
+        elif role == "assistant":
+            chunks.append(("asst_prefix", "<|im_start|>assistant\n"))
+            chunks.append(("asst_body", _render_minimind_assistant(m)))
+            chunks.append(("asst_suffix", "<|im_end|>\n"))
+
+    ids = [BOS_ID]
+    mask = [0]
+    for kind, text in chunks:
+        t_ids = enc.encode(text, allowed_special="all")
+        ids.extend(t_ids)
+        m_flag = 1 if kind in ("asst_body", "asst_suffix") else 0
+        mask.extend([m_flag] * len(t_ids))
+    ids.append(EOS_ID)
+    mask.append(1)
+
+    if len(ids) > MAX_SEQ_LEN:
+        global DROPPED_SAMPLE_COUNT
+        DROPPED_SAMPLE_COUNT += 1
+        return []
+    if sum(mask) == 0:
+        return []
+    return [(ids, mask)]
+
+
+def _is_minimind_format(raw_sample) -> bool:
+    return isinstance(raw_sample, dict) and "conversations" in raw_sample and "messages" not in raw_sample
+
+
+def build_datasets(data_path: str, max_samples: int | None = None):
     global DROPPED_SAMPLE_COUNT, TRUNCATED_SAMPLE_COUNT
     DROPPED_SAMPLE_COUNT = 0
     TRUNCATED_SAMPLE_COUNT = 0
 
     with open(data_path, encoding="utf-8") as handle:
-        raw = [json.loads(line) for line in handle]
+        raw = []
+        for i, line in enumerate(handle):
+            if max_samples is not None and i >= max_samples:
+                break
+            raw.append(json.loads(line))
 
     random.seed(SEED)
     random.shuffle(raw)
@@ -308,8 +409,13 @@ def build_datasets(data_path: str):
     val_raw = raw[:val_conv_n]
     train_raw = raw[val_conv_n:]
 
-    train_data = [sample for record in train_raw for sample in format_samples_split(record["messages"])]
-    val_data = [sample for record in val_raw for sample in format_samples_split(record["messages"])]
+    is_mm = raw and _is_minimind_format(raw[0])
+    formatter = format_minimind_record if is_mm else (lambda r: format_samples_split(r["messages"]))
+    if is_mm:
+        print("Data format: minimind conversations (chat_template + assistant-block loss mask)")
+
+    train_data = [sample for record in train_raw for sample in formatter(record)]
+    val_data = [sample for record in val_raw for sample in formatter(record)]
     if TRUNCATED_SAMPLE_COUNT or DROPPED_SAMPLE_COUNT:
         print(f"WARNING: truncated {TRUNCATED_SAMPLE_COUNT} samples, dropped {DROPPED_SAMPLE_COUNT} oversized samples")
     return raw, train_data, val_data
@@ -417,7 +523,7 @@ def main() -> None:
     _ensure_tokenizer()
     print(f"Special tokens: BOS={BOS_ID} USER={USER_ID} ASST={ASST_ID} EOS={EOS_ID}")
 
-    raw, train_data, val_data = build_datasets(data_path)
+    raw, train_data, val_data = build_datasets(data_path, max_samples=args.max_samples)
     print(f"Formatted: {len(train_data) + len(val_data)} samples (from {len(raw)} raw conversations)")
     print(f"Train: {len(train_data)}, Val: {len(val_data)}")
 

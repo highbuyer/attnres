@@ -735,11 +735,24 @@ def get_token_bytes(device="cpu"):
 
 
 def _read_parquet_batches(filepath, tokenizer_batch_size):
-    """Yield all document batches from a single parquet file."""
+    """Yield all document batches from a single parquet file.
+
+    Supports two schemas:
+      - {text}: 使用 text 列
+      - {instruction, output}: 拼接 instruction + "\\n" + output 作为 text (Belle 类数据)
+    """
     pf = pq.ParquetFile(filepath)
+    fields = set(pf.schema_arrow.names)
     for rg_idx in range(pf.num_row_groups):
         rg = pf.read_row_group(rg_idx)
-        batch = rg.column('text').to_pylist()
+        if 'text' in fields:
+            batch = rg.column('text').to_pylist()
+        elif 'instruction' in fields and 'output' in fields:
+            ins = rg.column('instruction').to_pylist()
+            out = rg.column('output').to_pylist()
+            batch = [(i or '') + '\n' + (o or '') for i, o in zip(ins, out)]
+        else:
+            raise ValueError(f"unsupported schema in {filepath}: fields={pf.schema_arrow.names}")
         for i in range(0, len(batch), tokenizer_batch_size):
             yield batch[i:i+tokenizer_batch_size]
 
