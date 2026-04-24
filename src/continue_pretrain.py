@@ -178,13 +178,21 @@ model_dim = config.n_embd
 dmodel_lr_scale = (model_dim / 768) ** -0.5
 print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-# 获取模型参数（排除 scalar 参数）
+# 获取模型参数（排除 scalar 参数和 1D 参数）
 scalar_param_names = set()
 for name, param in model.named_parameters():
     if any(scalar_name in name for scalar_name in ['softcap_logit', 'norm_gain', 'logit_scale']):
         scalar_param_names.add(name)
 
-matrix_params = [p for n, p in model.transformer.h.named_parameters() if n not in scalar_param_names]
+# Matrix 参数：只保留 2D 参数（Muon 优化器要求）
+# 排除 scalar 参数和 1D 参数（如 LayerNorm weights/biases）
+matrix_params = [p for n, p in model.transformer.h.named_parameters() 
+                 if n not in scalar_param_names and p.dim() == 2]
+
+# 1D 参数（LayerNorm 等）单独分组，使用 AdamW
+norm_1d_params = [p for n, p in model.transformer.h.named_parameters() 
+                  if n not in scalar_param_names and p.dim() == 1]
+
 all_value_embeds_params = list(model.value_embeds.parameters())
 embedding_params = list(model.transformer.wte.parameters())
 lm_head_params = list(model.lm_head.parameters())
@@ -224,6 +232,8 @@ param_groups = [
     dict(kind='adamw', params=new_ve_params, lr=EMBEDDING_LR * dmodel_lr_scale * NEW_VE_LR_SCALE, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
     dict(kind='adamw', params=attnres_proj_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
     dict(kind='adamw', params=attnres_norm_params, lr=0.15, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+    # 1D 参数（LayerNorm weights/biases）使用 AdamW
+    dict(kind='adamw', params=norm_1d_params, lr=MATRIX_LR * dmodel_lr_scale, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
 ]
 
 # Scalar 参数单独分组（softcap_logit, norm_gain 等）
