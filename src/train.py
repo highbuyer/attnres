@@ -82,6 +82,46 @@ def maybe_empty_cache(device):
         torch.cuda.empty_cache()
 
 
+try:
+    import ctypes
+except Exception:
+    ctypes = None
+
+_LIBC = None
+if os.name == "posix" and ctypes is not None:
+    try:
+        _LIBC = ctypes.CDLL("libc.so.6")
+    except OSError:
+        _LIBC = None
+
+
+def maybe_trim_host_memory():
+    if _LIBC is None:
+        return
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def prepare_for_eval(device):
+    gc_was_enabled = gc.isenabled()
+    if not gc_was_enabled:
+        gc.enable()
+    gc.collect()
+    maybe_empty_cache(device)
+    maybe_trim_host_memory()
+    return gc_was_enabled
+
+
+def finish_eval(device, gc_was_enabled):
+    gc.collect()
+    maybe_empty_cache(device)
+    maybe_trim_host_memory()
+    if not gc_was_enabled:
+        gc.disable()
+
+
 def peak_vram_mb(device):
     if device.type == "cuda":
         return torch.cuda.max_memory_allocated() / 1024 / 1024
@@ -425,20 +465,27 @@ class GPT(nn.Module):
         bs = self.sublayers_per_block
 
         def block_attn_res(completed_blocks, partial_block, proj_idx):
-            """Paper Fig.2: attend over completed blocks + partial block (if any), return h."""
+            """Paper Fig.2: attend over completed blocks + partial block (if any), return h.
+            Two-pass implementation: avoids materializing (N,B,T,C) stack to save memory."""
             if bs == 0:
-                # AttnRes disabled (control group): return partial_block as-is (pure residual)
                 return partial_block
             all_v = completed_blocks + ([partial_block] if partial_block is not None else [])
             if not all_v:
-                # first sub-layer of first block: partial_block is always x here, return it
                 return partial_block
-            V = torch.stack(all_v, dim=0)               # (N, B, T, C)
-            K = self.attnres_norm[proj_idx](V).to(V.dtype) # K = per-sublayer RMSNorm(V)
-            proj_w = self.attnres_proj[proj_idx].weight[0].to(V.dtype)  # (C,)
-            logits = torch.einsum('c,nbtc->nbt', proj_w, K)
-            attn_w = logits.float().softmax(dim=0).to(V.dtype)
-            return torch.einsum('nbt,nbtc->btc', attn_w, V)
+            # Pass 1: compute per-block logits, only stack (N,B,T)
+            proj_w = self.attnres_proj[proj_idx].weight[0]  # (C,)
+            logits_list = []
+            v_dtype = all_v[0].dtype
+            for v in all_v:
+                k = self.attnres_norm[proj_idx](v).to(v_dtype)
+                logits_list.append(torch.einsum('c,btc->bt', proj_w.to(v_dtype), k))
+            logits = torch.stack(logits_list, dim=0).float()  # (N, B, T)
+            attn_w = logits.softmax(dim=0).to(v_dtype)       # (N, B, T)
+            # Pass 2: weighted sum, no V stack materialization
+            result = torch.zeros_like(all_v[0])
+            for n in range(len(all_v)):
+                result.add_(attn_w[n].unsqueeze(-1) * all_v[n])
+            return result
 
         # Full grad flow: no detach anywhere (paper-exact).
         completed_blocks = []  # no detach: full grad flow
@@ -704,8 +751,11 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+train_model = model
 if os.environ.get("NO_COMPILE") != "1" and device.type == "cuda":
-    model = torch.compile(model, dynamic=False)
+    for block in model.transformer.h:
+        block.mlp = torch.compile(block.mlp, dynamic=False)
+    print("Per-module compile: mlp compiled (attn stays eager with FA3)")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -747,7 +797,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_context(device):
-            loss = model(x, y)
+            loss = train_model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -803,9 +853,12 @@ while True:
 
     # Periodic val eval + early stopping
     if step % EVAL_INTERVAL == 0:
-        maybe_empty_cache(device)
+        gc_was_enabled = prepare_for_eval(device)
+        model.eval()
         with torch.no_grad(), autocast_context(device):
             current_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
+        finish_eval(device, gc_was_enabled)
+        train_model.train()
         print(f"\nstep {step} eval val_bpb={current_bpb:.6f}")
         if current_bpb < best_val_bpb:
             best_val_bpb = current_bpb
@@ -830,11 +883,11 @@ total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
 del optimizer  # free optimizer states before eval
-gc.collect()
 model.eval()
-maybe_empty_cache(device)
+gc_was_enabled = prepare_for_eval(device)
 with torch.no_grad(), autocast_context(device):
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
+finish_eval(device, gc_was_enabled)
 
 # Final summary
 t_end = time.time()

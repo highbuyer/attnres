@@ -9,12 +9,13 @@ Usage:
 Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
 
+import argparse
+import gc
+import math
 import os
+import pickle
 import sys
 import time
-import math
-import argparse
-import pickle
 from multiprocessing import Pool
 
 import requests
@@ -30,7 +31,7 @@ import torch
 
 MAX_SEQ_LEN = 2048       # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+EVAL_TOKENS = int(os.environ.get('EVAL_TOKENS_MULT', 40)) * 524288  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -41,6 +42,18 @@ DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
 VAL_FILENAME = "val.parquet"  # pinned validation shard
 VOCAB_SIZE = 32768
+
+try:
+    import ctypes
+except Exception:
+    ctypes = None
+
+_LIBC = None
+if os.name == "posix" and ctypes is not None:
+    try:
+        _LIBC = ctypes.CDLL("libc.so.6")
+    except OSError:
+        _LIBC = None
 
 # HuggingFace parquet URLs
 # Belle: single parquet for the 0.5M CN instruction set
@@ -734,6 +747,15 @@ def get_token_bytes(device="cpu"):
         return torch.load(f, map_location=device)
 
 
+def _maybe_trim_host_memory():
+    if _LIBC is None:
+        return
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _read_parquet_batches(filepath, tokenizer_batch_size):
     """Yield all document batches from a single parquet file.
 
@@ -917,22 +939,25 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device="cuda"):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size, device=None):
+def evaluate_bpb(model, tokenizer, batch_size, device=None, max_tokens=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
     then converts nats/byte to bits/byte. Special tokens (byte length 0)
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    If max_tokens is None, uses EVAL_TOKENS (full eval).
     """
     if device is None:
         device = next(model.parameters()).device
     token_bytes = get_token_bytes(device=device)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val", device=device)
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    target_tokens = max_tokens if max_tokens is not None else EVAL_TOKENS
+    steps = target_tokens // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
-    for _ in range(steps):
+    cleanup_interval = 512
+    for step_idx in range(steps):
         x, y, _ = next(val_loader)
         loss_flat = model(x, y, reduction='none').view(-1)
         y_flat = y.view(-1)
@@ -940,6 +965,15 @@ def evaluate_bpb(model, tokenizer, batch_size, device=None):
         mask = nbytes > 0
         total_nats += (loss_flat * mask).sum().item()
         total_bytes += nbytes.sum().item()
+        if (step_idx + 1) % cleanup_interval == 0:
+            del x, y, loss_flat, y_flat, nbytes, mask
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+            _maybe_trim_host_memory()
+    del val_loader
+    gc.collect()
+    _maybe_trim_host_memory()
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,18 @@ import os
 import sys
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+try:
+    import ctypes
+except Exception:
+    ctypes = None
+
+_LIBC = None
+if os.name == "posix" and ctypes is not None:
+    try:
+        _LIBC = ctypes.CDLL("libc.so.6")
+    except OSError:
+        _LIBC = None
+
 # ---------------------------------------------------------------------------
 # Config（支持 env var / sys.argv 覆盖）
 # ---------------------------------------------------------------------------
@@ -42,10 +54,14 @@ WARMUP_RATIO = 0.05         # 25 steps warmup
 WARMDOWN_RATIO = 0.6
 FINAL_LR_FRAC = 0.05
 
-TOTAL_BATCH_SIZE = 2**19    # ~524K tokens per step
+TOTAL_BATCH_SIZE = int(os.environ.get('CPT_TOTAL_BATCH', str(2**19)))  # ~524K tokens per step
 DEVICE_BATCH_SIZE = int(os.environ.get('CPT_BATCH', 8))       # depth=18: 196M; d36 建议降到 2
 EVAL_INTERVAL = int(os.environ.get('CPT_EVAL_INTERVAL', 250))
 EARLY_STOP_PATIENCE = int(os.environ.get('CPT_PATIENCE', 8))
+# 分层 eval: fast eval (轻量, 每 EVAL_INTERVAL) + full eval (完整, 每 FULL_EVAL_INTERVAL)
+# fast eval 只用于监控 loss trend; 只有 full eval 触发 best checkpoint 和 early stopping
+FAST_EVAL_TOKENS = int(os.environ.get('CPT_FAST_EVAL_MULT', 4)) * 524288  # default ~2M tokens
+FULL_EVAL_INTERVAL = int(os.environ.get('CPT_FULL_EVAL_INTERVAL', 600))  # default 每 3 次 fast eval 做一次 full
 
 # ---------------------------------------------------------------------------
 # 加载模型定义（复用 train.py）
@@ -97,6 +113,35 @@ def save_checkpoint(path, ckpt):
     ckpt = dict(ckpt)
     ckpt['config'] = _config_to_ckpt(ckpt['config'])
     torch.save(ckpt, path)
+
+
+def maybe_trim_host_memory():
+    if _LIBC is None:
+        return
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def prepare_for_eval(device):
+    gc_was_enabled = gc.isenabled()
+    if not gc_was_enabled:
+        gc.enable()
+    gc.collect()
+    maybe_trim_host_memory()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    return gc_was_enabled
+
+
+def finish_eval(device, gc_was_enabled):
+    gc.collect()
+    maybe_trim_host_memory()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    if not gc_was_enabled:
+        gc.disable()
 
 # ---------------------------------------------------------------------------
 # 加载 checkpoint
@@ -181,8 +226,18 @@ optimizer = model.setup_optimizer(
 for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
+# 真 resume: 如果 checkpoint 包含 optimizer state，恢复训练状态
+resume_step = 0
+if 'optimizer_state' in ckpt:
+    optimizer.load_state_dict(ckpt['optimizer_state'])
+    resume_step = ckpt.get('step', 0)
+    print(f'True resume: restored optimizer state, resuming from step {resume_step}')
+
+train_model = model
 if os.environ.get('NO_COMPILE') != '1' and device.type == 'cuda':
-    model = torch.compile(model, dynamic=False)
+    for block in model.transformer.h:
+        block.mlp = torch.compile(block.mlp, dynamic=False)
+    print("Per-module compile: mlp compiled (attn stays eager with FA3)")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)
@@ -216,9 +271,12 @@ def get_weight_decay(progress):
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
-step = 0
-best_val_bpb = float('inf')
+step = resume_step
+best_val_bpb = ckpt[_metric_key]
 no_improve_count = 0
+
+# 定期保存 _last.pt 用于崩溃恢复
+_last_save_interval = max(EVAL_INTERVAL, 500)
 
 while True:
     if device.type == 'cuda':
@@ -226,7 +284,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = train_model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -265,37 +323,60 @@ while True:
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch}    ", end="", flush=True)
 
-    if step == 0:
+    if step == resume_step:
         gc.collect()
         gc.freeze()
         gc.disable()
 
     step += 1
 
-    # 定期评估
+    # 定期保存 _last.pt 用于崩溃恢复
+    if step % _last_save_interval == 0:
+        last_ckpt = {
+            'model_state': model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'config': config,
+            'val_bpb': best_val_bpb,
+            'step': step,
+            'continued_pretrain': True,
+        }
+        last_path = CHECKPOINT_OUT.replace('.pt', '_last.pt')
+        save_checkpoint(last_path, last_ckpt)
+
+    # 定期评估 (分层: fast 每 EVAL_INTERVAL, full 每 FULL_EVAL_INTERVAL)
     if step % EVAL_INTERVAL == 0:
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        is_full = (step % FULL_EVAL_INTERVAL == 0)
+        eval_type = "full" if is_full else "fast"
+        eval_tokens = None if is_full else FAST_EVAL_TOKENS
+        print(f"\nRunning {eval_type} eval at step {step}...", flush=True)
+        gc_was_enabled = prepare_for_eval(device)
+        model.eval()
         with torch.no_grad(), autocast_ctx:
-            current_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
-        print(f"\nstep {step} eval val_bpb={current_bpb:.6f}")
-        if current_bpb < best_val_bpb:
-            best_val_bpb = current_bpb
-            no_improve_count = 0
-            best_ckpt = {
-                'model_state': model.state_dict(),
-                'config': config,
-                'val_bpb': current_bpb,
-                'step': step,
-                'continued_pretrain': True,
-            }
-            save_checkpoint(CHECKPOINT_OUT, best_ckpt)
-            print(f"Saved {CHECKPOINT_OUT}: val_bpb={current_bpb:.6f}")
-        else:
-            no_improve_count += 1
-            if no_improve_count >= EARLY_STOP_PATIENCE:
-                print(f"Early stopping at step {step}: no improvement for {EARLY_STOP_PATIENCE} evals")
-                break
+            current_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device, max_tokens=eval_tokens)
+        finish_eval(device, gc_was_enabled)
+        train_model.train()
+        print(f"\nstep {step} {eval_type}_eval val_bpb={current_bpb:.6f}")
+        # 只有 full eval 参与 best checkpoint / early stopping 决策
+        if is_full:
+            if current_bpb < best_val_bpb:
+                best_val_bpb = current_bpb
+                no_improve_count = 0
+                best_ckpt = {
+                    'model_state': model.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'config': config,
+                    'val_bpb': current_bpb,
+                    'step': step,
+                    'continued_pretrain': True,
+                }
+                best_path = CHECKPOINT_OUT.replace('.pt', '_best.pt')
+                save_checkpoint(best_path, best_ckpt)
+                print(f"Saved {best_path}: val_bpb={current_bpb:.6f}")
+            else:
+                no_improve_count += 1
+                if no_improve_count >= EARLY_STOP_PATIENCE:
+                    print(f"Early stopping at step {step}: no improvement for {EARLY_STOP_PATIENCE} full evals")
+                    break
 
     if step >= TOTAL_STEPS:
         break
@@ -305,13 +386,11 @@ print()
 # ---------------------------------------------------------------------------
 # 最终评估
 # ---------------------------------------------------------------------------
-del optimizer
-gc.collect()
 model.eval()
-if device.type == 'cuda':
-    torch.cuda.empty_cache()
+gc_was_enabled = prepare_for_eval(device)
 with torch.no_grad(), autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, device=device)
+finish_eval(device, gc_was_enabled)
 
 t_end = time.time()
 peak_vram_mb = 0.0 if device.type != 'cuda' else torch.cuda.max_memory_allocated() / 1024 / 1024
@@ -324,20 +403,23 @@ print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"num_steps:        {step}")
 
-# 保存最终 checkpoint
+# 保存最终 checkpoint (含 optimizer state 供 resume)
 ckpt_final = {
     'model_state': model.state_dict(),
+    'optimizer_state': optimizer.state_dict(),
     'config': config,
     'val_bpb': val_bpb,
     'step': step,
     'continued_pretrain': True,
 }
-save_checkpoint(CHECKPOINT_OUT.replace('.pt', '_final.pt'), ckpt_final)
-print(f"Final checkpoint saved to {CHECKPOINT_OUT.replace('.pt', '_final.pt')}")
+_final_path = CHECKPOINT_OUT.replace('.pt', '_final.pt')
+save_checkpoint(_final_path, ckpt_final)
+print(f"Final checkpoint saved to {_final_path}")
 
-# 更新 best_checkpoint 如果有改善
+# 更新 best checkpoint 如果有改善
 if val_bpb < best_val_bpb:
-    save_checkpoint(CHECKPOINT_OUT, ckpt_final)
-    print(f"Updated {CHECKPOINT_OUT}: val_bpb={val_bpb:.6f}")
+    best_path = CHECKPOINT_OUT.replace('.pt', '_best.pt')
+    save_checkpoint(best_path, ckpt_final)
+    print(f"Updated {best_path}: val_bpb={val_bpb:.6f}")
 
 print(f"Done. Original: {_metric_key}={ckpt[_metric_key]:.6f}, Final: val_bpb={val_bpb:.6f}")
