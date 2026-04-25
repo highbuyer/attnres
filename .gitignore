@@ -47,6 +47,7 @@ results.tsv
 .claude/
 .omc/
 .specstory/
+.codex
 .cursorindexingignore
 
 # Logs
