@@ -1,0 +1,11 @@
+{
+  "remote": {
+    "name": "远程服务器",
+    "host": "your.host.example.com",
+    "port": 22,
+    "user": "root",
+    "password": "",
+    "work_dir": "/root/autodl-tmp/attnres",
+    "python": "/root/miniconda3/bin/python"
+  }
+}
