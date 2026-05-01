@@ -59,6 +59,7 @@ checkpoints/
 /data
 /datasets/sft_archive/
 /sft_*.jsonl
+/datasets/sft_*.jsonl
 
 # Generated evaluation / run outputs
 /eval_results_*.json
