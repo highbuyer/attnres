@@ -25,6 +25,11 @@ except Exception:
         flash_attn_func = None
     fa3 = _Fa3Stub()
 
+try:
+    from flash_attn import flash_attn_func as _fa2_func
+except Exception:
+    _fa2_func = None
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -162,9 +167,11 @@ class MLAttention(nn.Module):
             v = torch.cat([past_v, v], dim=1)
         new_kv = (k, v) if use_cache else None
 
-        # K/V head_dim 都是 64（v_head=64，qk_total=64）→ FA3 可用
+        # K/V head_dim 都是 64（v_head=64，qk_total=64）→ FA3/FA2 可用
         if hasattr(fa3, 'flash_attn_func') and fa3.flash_attn_func is not None and q.is_cuda:
             y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        elif _fa2_func is not None and q.is_cuda:
+            y = _fa2_func(q, k, v, causal=True, window_size=window_size)
         else:
             # CPU/无 FA3 fallback：SDPA
             q_sdpa = q.transpose(1, 2)   # (B, H, T_q, D)
